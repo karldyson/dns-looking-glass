@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"log"
 	"os"
 	"runtime/debug"
 
@@ -40,6 +41,7 @@ func main() {
 		return
 	}
 
+	log.Printf("dnslg-api %s (built %s) starting on port %d, bind %s", version.Version, version.BuildTime, *port, *bind)
 	srv := server.New(*port, *bind)
 	if err := srv.ListenAndServe(); err != nil {
 		fmt.Fprintf(os.Stderr, "fatal: %v\n", err)

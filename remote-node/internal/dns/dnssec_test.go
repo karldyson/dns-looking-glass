@@ -215,17 +215,17 @@ func TestVerifyDNSKEYRRSig_Valid(t *testing.T) {
 	rrset := []dns.RR{ksk}
 	sig := signRRset(t, ksk, signer, rrset)
 	msg := &dns.Msg{Answer: []dns.RR{ksk, sig}}
-	if !verifyDNSKEYRRSig([]*dns.DNSKEY{ksk}, msg) {
-		t.Error("expected true for valid self-signature")
+	if err := verifyDNSKEYRRSig([]*dns.DNSKEY{ksk}, msg); err != nil {
+		t.Errorf("expected nil for valid self-signature, got %v", err)
 	}
 }
 
 func TestVerifyDNSKEYRRSig_NoRRSIG(t *testing.T) {
 	ksk, _ := makeKSK(t, "example.com.")
 	msg := &dns.Msg{Answer: []dns.RR{ksk}}
-	// No RRSIGs — function returns true (trust established via DS comparison).
-	if !verifyDNSKEYRRSig([]*dns.DNSKEY{ksk}, msg) {
-		t.Error("expected true when no RRSIGs present")
+	// No RRSIGs — function returns nil (trust established via DS comparison).
+	if err := verifyDNSKEYRRSig([]*dns.DNSKEY{ksk}, msg); err != nil {
+		t.Errorf("expected nil when no RRSIGs present, got %v", err)
 	}
 }
 
@@ -235,8 +235,8 @@ func TestVerifyDNSKEYRRSig_WrongKey(t *testing.T) {
 	sig := signRRset(t, ksk1, signer1, []dns.RR{ksk1})
 	msg := &dns.Msg{Answer: []dns.RR{ksk1, sig}}
 	// Provide ksk2: different KeyTag → the tag check in the loop never matches.
-	if verifyDNSKEYRRSig([]*dns.DNSKEY{ksk2}, msg) {
-		t.Error("expected false with wrong key")
+	if err := verifyDNSKEYRRSig([]*dns.DNSKEY{ksk2}, msg); err == nil {
+		t.Error("expected non-nil error with wrong key")
 	}
 }
 
@@ -326,7 +326,7 @@ func TestParseDelegationChain_ThreeLevels(t *testing.T) {
 		{QType: "A", Nameserver: "136.244.99.193:53", ResponseBytesHex: packHex(t, nxMsg)},
 	}
 
-	levels := parseDelegationChain(chain)
+	levels, _ := parseDelegationChain(chain)
 	if len(levels) != 3 {
 		t.Fatalf("want 3 levels, got %d", len(levels))
 	}
@@ -388,7 +388,7 @@ func TestParseDelegationChain_AllDNSKEYSteps(t *testing.T) {
 		{QType: "DNSKEY", Nameserver: "213.248.220.80:53", ResponseBytesHex: packHex(t, answerMsg)},
 	}
 
-	levels := parseDelegationChain(chain)
+	levels, _ := parseDelegationChain(chain)
 	if len(levels) != 2 {
 		t.Errorf("want 2 levels (root + uk. NODATA), got %d", len(levels))
 	}
@@ -422,9 +422,143 @@ func TestParseDelegationChain_SkipsEmptyResponseHex(t *testing.T) {
 		{QType: "A", Nameserver: "213.248.220.80:53", ResponseBytesHex: packHex(t, answerMsg)},
 	}
 
-	levels := parseDelegationChain(chain)
+	levels, _ := parseDelegationChain(chain)
 	if len(levels) != 2 {
 		t.Errorf("want 2 levels (empty ResponseBytesHex skipped), got %d", len(levels))
+	}
+}
+
+func TestParseDelegationChain_StubLevel_UnsignedChildUnreachable(t *testing.T) {
+	// Regression test for the bug where an unsigned child zone showed as
+	// "indeterminate" instead of "insecure" when the parent-delegated NS
+	// servers were unreachable (SERVFAIL) or produced no valid response.
+	//
+	// The parent referral carries no DS for the child (unsigned delegation).
+	// A SERVFAIL from the child is skipped by parseDelegationChain. Before the
+	// fix the chain stopped at the parent level; after the fix a stub level is
+	// added for the child with ds=nil so validateChainOfTrust can return "insecure".
+
+	dsNSEC3 := &dns.DS{
+		Hdr:    dns.RR_Header{Name: "nsec3.uk.", Rrtype: dns.TypeDS, Class: dns.ClassINET, Ttl: 900},
+		KeyTag: 2222, Algorithm: 13, DigestType: dns.SHA256, Digest: "DEADBEEF",
+	}
+	rootMsg := &dns.Msg{MsgHdr: dns.MsgHdr{Response: true}}
+	rootMsg.Ns = []dns.RR{
+		&dns.NS{Hdr: dns.RR_Header{Name: "nsec3.uk.", Rrtype: dns.TypeNS, Class: dns.ClassINET, Ttl: 172800}, Ns: "ns1.nsec3.uk."},
+		dsNSEC3,
+	}
+
+	// Parent referral for the child zone — no DS (unsigned delegation).
+	parentReferral := &dns.Msg{MsgHdr: dns.MsgHdr{Response: true}}
+	parentReferral.Ns = []dns.RR{
+		&dns.NS{Hdr: dns.RR_Header{Name: "mismatched-ns-unsigned.nsec3.uk.", Rrtype: dns.TypeNS, Class: dns.ClassINET, Ttl: 3600}, Ns: "ns1.mismatched-ns-unsigned.nsec3.uk."},
+		// No DS record — unsigned delegation.
+	}
+
+	servfailMsg := &dns.Msg{MsgHdr: dns.MsgHdr{Response: true, Rcode: dns.RcodeServerFailure}}
+
+	chain := []ResolutionStep{
+		{QType: "SOA", Nameserver: "198.41.0.4:53", ResponseBytesHex: packHex(t, rootMsg)},
+		{QType: "SOA", Nameserver: "1.2.3.4:53", ResponseBytesHex: packHex(t, parentReferral)},
+		// SERVFAIL from the delegated NS — skipped by parseDelegationChain.
+		{QType: "SOA", Nameserver: "5.6.7.8:53", ResponseBytesHex: packHex(t, servfailMsg)},
+	}
+
+	levels, _ := parseDelegationChain(chain)
+	if len(levels) != 3 {
+		t.Fatalf("want 3 levels (root, nsec3.uk, stub for child), got %d", len(levels))
+	}
+	if levels[2].zone != "mismatched-ns-unsigned.nsec3.uk." {
+		t.Errorf("levels[2].zone = %q, want \"mismatched-ns-unsigned.nsec3.uk.\"", levels[2].zone)
+	}
+	if levels[2].ds != nil {
+		t.Errorf("levels[2].ds = %v, want nil (unsigned delegation)", levels[2].ds)
+	}
+	if levels[2].resp != nil {
+		t.Errorf("levels[2].resp = %v, want nil (stub level has no response)", levels[2].resp)
+	}
+}
+
+func TestParseDelegationChain_StubLevel_EmptyHex(t *testing.T) {
+	// Same as above but the child step has an empty ResponseBytesHex (synthetic
+	// diagnostic step generated when all NS names fail to resolve).
+	dsNSEC3 := &dns.DS{
+		Hdr:    dns.RR_Header{Name: "nsec3.uk.", Rrtype: dns.TypeDS, Class: dns.ClassINET, Ttl: 900},
+		KeyTag: 2222, Algorithm: 13, DigestType: dns.SHA256, Digest: "DEADBEEF",
+	}
+	rootMsg := &dns.Msg{MsgHdr: dns.MsgHdr{Response: true}}
+	rootMsg.Ns = []dns.RR{
+		&dns.NS{Hdr: dns.RR_Header{Name: "nsec3.uk.", Rrtype: dns.TypeNS, Class: dns.ClassINET, Ttl: 172800}, Ns: "ns1.nsec3.uk."},
+		dsNSEC3,
+	}
+	parentReferral := &dns.Msg{MsgHdr: dns.MsgHdr{Response: true}}
+	parentReferral.Ns = []dns.RR{
+		&dns.NS{Hdr: dns.RR_Header{Name: "mismatched-ns-unsigned.nsec3.uk.", Rrtype: dns.TypeNS, Class: dns.ClassINET, Ttl: 3600}, Ns: "ns1.mismatched-ns-unsigned.nsec3.uk."},
+	}
+
+	chain := []ResolutionStep{
+		{QType: "SOA", Nameserver: "198.41.0.4:53", ResponseBytesHex: packHex(t, rootMsg)},
+		{QType: "SOA", Nameserver: "1.2.3.4:53", ResponseBytesHex: packHex(t, parentReferral)},
+		// Synthetic diagnostic step — no wire bytes.
+		{QType: "SOA", Nameserver: "ns1.mismatched-ns-unsigned.nsec3.uk.:53", ResponseBytesHex: "", ResponseText: "delegation cannot be followed — NS name(s) unresolvable"},
+	}
+
+	levels, _ := parseDelegationChain(chain)
+	if len(levels) != 3 {
+		t.Fatalf("want 3 levels (root, nsec3.uk, stub for child), got %d", len(levels))
+	}
+	if levels[2].zone != "mismatched-ns-unsigned.nsec3.uk." {
+		t.Errorf("levels[2].zone = %q, want \"mismatched-ns-unsigned.nsec3.uk.\"", levels[2].zone)
+	}
+	if levels[2].ds != nil {
+		t.Errorf("levels[2].ds = %v, want nil (unsigned delegation)", levels[2].ds)
+	}
+}
+
+func TestParseDelegationChain_StubNotAddedWhenChildResponds(t *testing.T) {
+	// When the child zone does respond successfully, no extra stub level should
+	// be added — the existing level from the real response is sufficient.
+	dsNSEC3 := &dns.DS{
+		Hdr:    dns.RR_Header{Name: "nsec3.uk.", Rrtype: dns.TypeDS, Class: dns.ClassINET, Ttl: 900},
+		KeyTag: 2222, Algorithm: 13, DigestType: dns.SHA256, Digest: "DEADBEEF",
+	}
+	rootMsg := &dns.Msg{MsgHdr: dns.MsgHdr{Response: true}}
+	rootMsg.Ns = []dns.RR{
+		&dns.NS{Hdr: dns.RR_Header{Name: "nsec3.uk.", Rrtype: dns.TypeNS, Class: dns.ClassINET, Ttl: 172800}, Ns: "ns1.nsec3.uk."},
+		dsNSEC3,
+	}
+	parentReferral := &dns.Msg{MsgHdr: dns.MsgHdr{Response: true}}
+	parentReferral.Ns = []dns.RR{
+		&dns.NS{Hdr: dns.RR_Header{Name: "mismatched-ns-unsigned.nsec3.uk.", Rrtype: dns.TypeNS, Class: dns.ClassINET, Ttl: 3600}, Ns: "ns1.mismatched-ns-unsigned.nsec3.uk."},
+	}
+	// The child zone responds with an authoritative SOA answer.
+	answerMsg := &dns.Msg{MsgHdr: dns.MsgHdr{Response: true, Authoritative: true}}
+	answerMsg.Answer = []dns.RR{
+		&dns.SOA{
+			Hdr:     dns.RR_Header{Name: "mismatched-ns-unsigned.nsec3.uk.", Rrtype: dns.TypeSOA, Class: dns.ClassINET, Ttl: 900},
+			Ns:      "ns1.mismatched-ns-unsigned.nsec3.uk.",
+			Mbox:    "hostmaster.mismatched-ns-unsigned.nsec3.uk.",
+			Serial:  2026060101,
+			Refresh: 3600, Retry: 900, Expire: 604800, Minttl: 300,
+		},
+	}
+
+	chain := []ResolutionStep{
+		{QType: "SOA", Nameserver: "198.41.0.4:53", ResponseBytesHex: packHex(t, rootMsg)},
+		{QType: "SOA", Nameserver: "1.2.3.4:53", ResponseBytesHex: packHex(t, parentReferral)},
+		{QType: "SOA", Nameserver: "5.6.7.8:53", ResponseBytesHex: packHex(t, answerMsg)},
+	}
+
+	levels, _ := parseDelegationChain(chain)
+	if len(levels) != 3 {
+		t.Fatalf("want exactly 3 levels (no extra stub), got %d", len(levels))
+	}
+	// The third level should be from the real response, not a stub.
+	if levels[2].resp == nil {
+		t.Error("levels[2].resp is nil — expected real response, not stub")
+	}
+	if levels[2].zone != "mismatched-ns-unsigned.nsec3.uk." {
+		t.Errorf("levels[2].zone = %q, want \"mismatched-ns-unsigned.nsec3.uk.\"", levels[2].zone)
 	}
 }
 
@@ -480,17 +614,53 @@ var validationCases = []struct {
 	// Wildcard NODATA: query matches a wildcard but the type is absent from the
 	// wildcard RRset; both NSEC and NSEC3 zones use this proof structure.
 	{"wildcard NODATA in NSEC3 zone", "jkjhkjkjh.junesta.com.", "TXT", true},
-	// ANY queries: both test servers implement RFC 8482 and return a minimal NOERROR
-	// response (no RRSIGs) rather than the full RRset. The chain of trust is
-	// verified but the response is not cryptographically provable → indeterminate.
-	// If a server ever returns a signed ANY answer, this should become true.
-	{"ANY query for signed zone apex (RFC 8482 server)", "junesta.com.", "ANY", "indeterminate"},
-	// nsec3.uk. also returns RFC 8482 for ANY, even for non-existent names — so
-	// we see NOERROR not NXDOMAIN and can't prove anything about the name.
-	{"ANY for non-existent name (RFC 8482 server returns NOERROR)", "nonexistent.nsec3.uk.", "ANY", "indeterminate"},
+	// ANY queries: servers previously returned RFC 8482 minimal responses (no RRSIGs),
+	// but now return fully signed ANY responses — validated as SECURE.
+	{"ANY query for signed zone apex", "junesta.com.", "ANY", true},
+	// nsec3.uk. returns a fully signed NXDOMAIN with NSEC3 proof for non-existent names.
+	{"ANY for non-existent name (NXDOMAIN with NSEC3 proof)", "nonexistent.nsec3.uk.", "ANY", true},
+
+	// Regression: cross-zone CNAME to an unsigned target. The CNAME itself is in
+	// nsec3.uk. (signed, secure) but google.com. is unsigned (no DS in com.) so the
+	// CNAME target chain is insecure. The overall result must be the weaker: insecure.
+	{"secure CNAME to unsigned remote target", "remote-cname.nsec3.uk.", "A", "insecure"},
+
+	// Regression: NXDOMAIN where the answer section contains a CNAME to a
+	// non-existent target. The authoritative server (nsec3.uk.) returns the CNAME
+	// record plus NSEC3 records proving the CNAME target doesn't exist — all in a
+	// single NXDOMAIN response. The denial proof must be checked against the CNAME
+	// target, not the original query name (which exists, as a CNAME).
+	{"NXDOMAIN with CNAME in answer (denial proven for CNAME target)", "nxd-rhs-cname.nsec3.uk.", "A", true},
+
+	// alg-16.nsec3.uk is signed with ED448 (algorithm 16). miekg/dns has a
+	// constant for ED448 but no crypto implementation — Verify returns ErrAlg.
+	// The validator must report indeterminate with the algorithm name, not bogus.
+	{"ED448-signed zone (algorithm 16, unsupported by miekg/dns)", "alg-16.nsec3.uk.", "SOA", "indeterminate"},
 
 	// ── Should validate as BOGUS ───────────────────────────────────────────────
-	// Add bogus test zones below:
+	// missing-delegation.nsec3.uk: the shared nameserver (ns.junesta.uk.) serves
+	// this zone locally, but nsec3.uk. has no NS delegation for it. Our SOA-based
+	// child-zone detection fires, fetches DS → NOERROR + no DS + NSEC3 records that
+	// show no NS record at this name. The parent's NSEC3 proof means the "zone" is
+	// outside the secure hierarchy → BOGUS.
+	{"zone served locally with no parent NS delegation (parent NSEC3 proves no NS)", "missing-delegation.nsec3.uk.", "A", false},
+	// missing-delegation.c.je: same scenario, but the parent (c.je) uses NSEC not
+	// NSEC3. SOA detection fires; DS fetch returns NXDOMAIN + NSEC denial records
+	// (ns.junesta.net serves c.je; the name missing-delegation.c.je. falls between
+	// ip6.c.je. and p.c.je. in the NSEC chain). The authenticated NXDOMAIN proves
+	// the name doesn't exist in the parent at all → BOGUS.
+	// (Verified: ns.junesta.net returns NXDOMAIN + NSEC chain for the DS query.)
+	{"zone with no parent entry in NSEC zone (parent NSEC proves NXDOMAIN for DS)", "missing-delegation.c.je.", "SOA", false},
+
+	// Regression: ds-alg-2.alg-8.nsec3.uk is nested two delegation levels below
+	// nsec3.uk. (nsec3.uk. → alg-8.nsec3.uk. → ds-alg-2.alg-8.nsec3.uk.). All
+	// three zones are served by ns.junesta.uk., which answers queries for
+	// ds-alg-2.alg-8.nsec3.uk. directly (AA=1) without giving an intermediate
+	// referral through alg-8.nsec3.uk. The DS for ds-alg-2.alg-8.nsec3.uk. is
+	// signed by alg-8.nsec3.uk.'s ZSK — so the validator must detect that the DS
+	// RRSIG signer differs from the last seen zone (nsec3.uk.) and validate the
+	// intermediate zone chain before verifying the DS RRSIG.
+	{"multi-level shared-NS delegation (DS RRSIG signer is intermediate zone)", "ds-alg-2.alg-8.nsec3.uk.", "A", true},
 
 	// ── Should be insecure (signed parent, no DS for child) ───────────────────
 	// p.c.je exists (c.je delegates to it) but has no DS in c.je → insecure.
@@ -499,6 +669,14 @@ var validationCases = []struct {
 	// serves ox.junesta.net records without a referral, so signerZone differs from
 	// last.zone and we explicitly fetch the DS. NOERROR + no DS → insecure.
 	{"HTTPS in zone served without referral and no parent DS", "polecat.ox.junesta.net.", "HTTPS", "insecure"},
+	// Regression: mismatched-ns-unsigned.nsec3.uk has no DS in nsec3.uk. The
+	// parent-delegated NS (ns.junesta.uk.) is the same server that serves nsec3.uk.,
+	// so it answers the SOA query directly (AA=1) without sending a referral first.
+	// Because the child zone is unsigned there are no RRSIGs, so the RRSIG-based
+	// signerZone detection produces nothing. The SOA owner fallback detects the
+	// child zone from the SOA record in the answer and then fetches its DS →
+	// NOERROR + no DS → insecure.
+	{"mismatched delegation NS, unsigned, served by parent NS (SOA detection)", "mismatched-ns-unsigned.nsec3.uk.", "SOA", "insecure"},
 
 	// ── Should be indeterminate (can't complete) ───────────────────────────────
 	// Add indeterminate test zones below:

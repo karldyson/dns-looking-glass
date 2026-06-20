@@ -151,15 +151,39 @@ func execRecursive(req *QueryRequest) *QueryResponse {
 					nameservers = next
 					continue
 				}
-				// Need to resolve NS names — use first NS name.
-				nsName := extractFirstNSName(resp.Ns)
-				if nsName != "" {
+				// Need to resolve NS names — try all listed NS names in case some
+				// are unresolvable (only the first was tried previously).
+				nsNames := extractAllNSNames(resp.Ns)
+				nsResolved := false
+				for _, nsName := range nsNames {
 					dbg("step %d: resolving NS name %s", step, nsName)
 					nsAddrs := resolveNSAddr(nsName, req.Flags.DO)
 					if len(nsAddrs) > 0 {
 						nameservers = nsAddrs
-						continue
+						nsResolved = true
+						break
 					}
+				}
+				if nsResolved {
+					continue
+				}
+				if len(nsNames) > 0 {
+					// Delegation received but none of the NS names could be resolved
+					// to an address. Add a synthetic step so the chain shows why
+					// resolution stopped here rather than silently ending.
+					failMsg := fmt.Sprintf("delegation to %s received from %s — NS: %s — "+
+						"could not resolve any delegated nameserver to an address "+
+						"(NXDOMAIN, NODATA, or unreachable); delegation cannot be followed",
+						target, cur.name, strings.Join(nsNames, ", "))
+					dbg("step %d: %s", step, failMsg)
+					chain = append(chain, ResolutionStep{
+						Nameserver:     nsNames[0] + ":53",
+						NameserverName: strings.Join(nsNames, ", "),
+						QName:          target,
+						QType:          dns.TypeToString[currentType],
+						ResponseText:   failMsg,
+						StepNote:       "delegation cannot be followed — NS name(s) unresolvable",
+					})
 				}
 			}
 			dbg("step %d: NODATA or unresolvable", step)
@@ -228,15 +252,16 @@ type callerDSEntry struct {
 }
 
 // parseDelegationChain converts the resolution step list into a sequence of zone
-// levels. Each level carries the zone name, its authoritative NS, the DS records
-// the parent provided, and the parsed response. DO must have been set during
-// resolution so that DS records appear in authority sections.
-func parseDelegationChain(chain []ResolutionStep) []zoneLevel {
-	var levels []zoneLevel
+// levels. Returns the levels and the index in chain of the last step consumed
+// (or -1 if no usable step was found). The caller can use chain[lastIdx+1:] to
+// obtain the remaining steps after the terminal answer — useful for CNAME chains
+// that cross zone boundaries, where the remainder is the CNAME target's resolution.
+func parseDelegationChain(chain []ResolutionStep) (levels []zoneLevel, lastIdx int) {
+	lastIdx = -1
 	var pendingDS []*dns.DS
 	currentZone := "."
 
-	for _, step := range chain {
+	for i, step := range chain {
 		if step.ResponseBytesHex == "" {
 			continue
 		}
@@ -257,6 +282,7 @@ func parseDelegationChain(chain []ResolutionStep) []zoneLevel {
 
 		ns := namedAddr{addr: step.Nameserver, name: step.NameserverName}
 		levels = append(levels, zoneLevel{zone: currentZone, ns: ns, ds: pendingDS, resp: resp})
+		lastIdx = i
 
 		// NXDOMAIN and answers are terminal.
 		if resp.Rcode == dns.RcodeNameError || len(resp.Answer) > 0 {
@@ -282,7 +308,28 @@ func parseDelegationChain(chain []ResolutionStep) []zoneLevel {
 		currentZone = nextZone
 	}
 
-	return levels
+	// If the last referral named a child zone but we never received a usable response
+	// from its servers (SERVFAIL, unreachable, or synthetic diagnostic step with no
+	// wire bytes), add a stub level for that zone with the pending DS from the parent
+	// referral. The resolver is parent-centric: DNSSEC status is determined by the
+	// parent's DS (or proven absence thereof), not by reaching the child's servers.
+	//
+	// For unsigned delegations (pendingDS == nil) this stub causes validateChainOfTrust
+	// to return "insecure" instead of misidentifying the parent referral as the final
+	// answer and returning "indeterminate".
+	//
+	// For signed delegations where the child is unreachable, the stub carries a non-nil
+	// pendingDS but an empty ns.addr; the subsequent DNSKEY fetch fails → "indeterminate",
+	// which is the correct result when the signed zone cannot be reached.
+	//
+	// TODO: a future option to switch to child-centric mode (retry resolution using the
+	// child zone's own NS records when they differ from the parent delegation) would
+	// complement this; track in GitHub issue.
+	if len(levels) > 0 && currentZone != "." && currentZone != levels[len(levels)-1].zone {
+		levels = append(levels, zoneLevel{zone: currentZone, ds: pendingDS})
+	}
+
+	return levels, lastIdx
 }
 
 // validateChainOfTrust performs full DNSSEC chain-of-trust validation. It parses
@@ -297,7 +344,7 @@ func validateChainOfTrust(chain []ResolutionStep, req *QueryRequest) (interface{
 		return "indeterminate", nil
 	}
 
-	levels := parseDelegationChain(chain)
+	levels, lastChainIdx := parseDelegationChain(chain)
 	if len(levels) == 0 {
 		dbg("validate: no delegation levels parsed")
 		return "indeterminate", nil
@@ -454,7 +501,14 @@ func validateChainOfTrust(chain []ResolutionStep, req *QueryRequest) (interface{
 			}
 		}
 
-		if !verifyDNSKEYRRSig(keys, keyResp) {
+		if err := verifyDNSKEYRRSig(keys, keyResp); err != nil {
+			if err == dns.ErrAlg {
+				algName := dnsKeyAlgName(keys)
+				dbg("validate: DNSKEY self-sig for %s uses unsupported algorithm %s — indeterminate", level.zone, algName)
+				step.StepNote += fmt.Sprintf(", DNSKEY self-signature uses unsupported algorithm %s — indeterminate", algName)
+				extraSteps = append(extraSteps, step)
+				return "indeterminate", extraSteps
+			}
 			dbg("validate: DNSKEY self-sig failed for %s → BOGUS", level.zone)
 			step.StepNote += ", DNSKEY self-signature failed (BOGUS)"
 			extraSteps = append(extraSteps, step)
@@ -526,6 +580,29 @@ func validateChainOfTrust(chain []ResolutionStep, req *QueryRequest) (interface{
 			break
 		}
 	}
+
+	// Fallback for unsigned child zones served by the same nameserver as the
+	// parent: if the RRSIG scan found no child zone boundary (either there are no
+	// RRSIGs at all, or all RRSIGs are signed by last.zone), look for a SOA record
+	// whose owner name is a subdomain of last.zone. A SOA owner is the zone apex,
+	// so finding one here means the server answered directly for the child without
+	// a referral and the child is unsigned. This covers both answer-section SOA
+	// (SOA queries) and authority-section SOA (NODATA responses).
+	if signerZone == last.zone {
+		qnFqdn := strings.ToLower(dns.Fqdn(req.QName))
+		if strings.HasSuffix(qnFqdn, "."+last.zone) {
+			for _, rr := range append(last.resp.Answer, last.resp.Ns...) {
+				if soa, ok := rr.(*dns.SOA); ok {
+					if z := strings.ToLower(dns.Fqdn(soa.Hdr.Name)); z != last.zone {
+						signerZone = z
+						dbg("validate: child zone %s detected via SOA owner (no RRSIGs — unsigned child?)", signerZone)
+						break
+					}
+				}
+			}
+		}
+	}
+
 	dbg("validate: final answer zone=%s signer=%s", last.zone, signerZone)
 
 	// RFC 4035 §5.3.1: RRSIG SignerName must be an ancestor (or equal) of the RRset
@@ -553,6 +630,7 @@ func validateChainOfTrust(chain []ResolutionStep, req *QueryRequest) (interface{
 		dsResp, dsStep := fetchDSResponse(signerZone, last.ns)
 		dsStep.StepNote = fmt.Sprintf("Fetching DS for %s (zone boundary not seen in referrals)", signerZone)
 		extraSteps = append(extraSteps, dsStep)
+		dsStepIdx := len(extraSteps) - 1
 
 		if dsResp == nil {
 			dbg("validate: DS fetch failed for %s", signerZone)
@@ -587,9 +665,99 @@ func validateChainOfTrust(chain []ResolutionStep, req *QueryRequest) (interface{
 				dbg("validate: using %d caller-supplied DS for %s (no parent DS)", len(entry.ds), signerZone)
 				extraSteps[len(extraSteps)-1].StepNote += fmt.Sprintf(
 					" — no DS in parent; using caller-supplied trust anchor (%d DS record(s))", len(entry.ds))
-			} else if dsResp.Rcode == dns.RcodeSuccess {
-				// NOERROR with no DS means the parent explicitly has no DS for this
-				// zone — unsigned delegation (RFC 4035 §5.2).
+			} else if dsResp.Rcode == dns.RcodeSuccess || dsResp.Rcode == dns.RcodeNameError {
+				// NOERROR + no DS  — parent has no DS for this child; either the
+				//   delegation is unsigned (insecure) or no delegation exists (bogus).
+				// NXDOMAIN          — parent says the name doesn't exist at all;
+				//   if authenticated by NSEC/NSEC3 this is definitively bogus.
+				//
+				// In both cases, check the authority section for NSEC/NSEC3 denial
+				// records.  A verified record lets us distinguish:
+				//   • NOERROR: NS in bitmap → real unsigned delegation (insecure)
+				//              NS absent    → no delegation (bogus)
+				//   • NXDOMAIN: name provably absent from parent  → bogus
+				// If no denial records can be verified we fall through to the
+				// appropriate default for each rcode.
+				dsNSECs, dsNSEC3s := extractDenialRRs(dsResp.Ns)
+				if len(dsNSEC3s) > 0 || len(dsNSECs) > 0 {
+					// Collect denial RRs and their RRSIGs as generic RR slices for verifySig.
+					var denialRRs []dns.RR
+					var denialSigs []*dns.RRSIG
+					for _, rr := range dsResp.Ns {
+						switch v := rr.(type) {
+						case *dns.NSEC3:
+							denialRRs = append(denialRRs, v)
+						case *dns.NSEC:
+							denialRRs = append(denialRRs, v)
+						case *dns.RRSIG:
+							if v.TypeCovered == dns.TypeNSEC3 || v.TypeCovered == dns.TypeNSEC {
+								denialSigs = append(denialSigs, v)
+							}
+						}
+					}
+					// Verify at least one NSEC3/NSEC RRSIG with the parent's validated keys.
+					anyVerified := false
+					for _, sig := range denialSigs {
+						rrset := rrsetForSig(denialRRs, sig)
+						if len(rrset) == 0 {
+							continue
+						}
+						for _, key := range keys {
+							if key.KeyTag() == sig.KeyTag {
+								if verifySig(sig, key, rrset) == nil {
+									anyVerified = true
+									break
+								}
+							}
+						}
+						if anyVerified {
+							break
+						}
+					}
+					if anyVerified {
+						if dsResp.Rcode == dns.RcodeNameError {
+							// Authenticated NXDOMAIN: the name doesn't exist in the parent
+							// at all — no delegation is possible.
+							dbg("validate: parent NSEC/NSEC3 proves NXDOMAIN for %s → BOGUS", signerZone)
+							extraSteps[len(extraSteps)-1].StepNote += fmt.Sprintf(
+								" — parent NSEC/NSEC3 proves %s does not exist; zone not in secure hierarchy — BOGUS", signerZone)
+							return false, extraSteps
+						}
+						// NOERROR: check whether the parent has an NS record at the child zone name.
+						nameHasNS := false
+						for _, n3 := range dsNSEC3s {
+							if n3.Match(signerZone) {
+								nameHasNS = typeInNSEC3Bitmap(n3, dns.TypeNS)
+								break
+							}
+						}
+						if !nameHasNS {
+							for _, n := range dsNSECs {
+								if strings.EqualFold(dns.Fqdn(n.Hdr.Name), dns.Fqdn(signerZone)) {
+									nameHasNS = typeInNSECBitmap(n, dns.TypeNS)
+									break
+								}
+							}
+						}
+						if !nameHasNS {
+							// Parent's denial records prove either the name doesn't exist at
+							// all, or it exists without NS records — no valid delegation. Any
+							// zone "served" by the shared nameserver is outside the secure
+							// hierarchy.
+							dbg("validate: parent denial records show no NS delegation for %s → BOGUS", signerZone)
+							extraSteps[len(extraSteps)-1].StepNote += fmt.Sprintf(
+								" — parent NSEC3/NSEC proves no NS delegation for %s; zone not in secure hierarchy — BOGUS", signerZone)
+							return false, extraSteps
+						}
+						dbg("validate: parent denial records confirm NS delegation exists for %s, no DS → insecure", signerZone)
+					}
+				}
+				if dsResp.Rcode == dns.RcodeNameError {
+					// Unverified NXDOMAIN: we can't authenticate the parent's claim.
+					dbg("validate: NXDOMAIN for DS of %s but denial records unverified → indeterminate", signerZone)
+					extraSteps[len(extraSteps)-1].StepNote += " — parent returned NXDOMAIN for DS but NSEC/NSEC3 proof unverifiable (indeterminate)"
+					return "indeterminate", extraSteps
+				}
 				dbg("validate: NOERROR but no DS for %s → insecure", signerZone)
 				extraSteps[len(extraSteps)-1].StepNote += " — no DS records in parent, unsigned delegation (insecure)"
 				selfSteps, _ := attemptSelfVerification(signerZone, last)
@@ -606,14 +774,38 @@ func validateChainOfTrust(chain []ResolutionStep, req *QueryRequest) (interface{
 				" — + %d caller-supplied DS (add mode, RRSIG covers parent DS only)", len(entry.ds))
 		}
 
-		if !callerSuppliedDS && !verifyDSRRSigInAnswer(dsResp.Answer, keys) {
+		// The DS RRSIG may be signed by an intermediate zone that was skipped because the
+		// server answered AA=1 for the child zone directly without giving intermediate
+		// referrals (e.g. ns.junesta.uk. serves nsec3.uk., alg-8.nsec3.uk., and
+		// ds-alg-2.alg-8.nsec3.uk. and jumps straight to the deepest zone). In that case
+		// the DS RRSIG signer won't match last.zone and we need to validate the intermediate
+		// zone chain before we can verify the DS signature.
+		keysForDS := keys
+		for _, rr := range dsResp.Answer {
+			if sig, ok := rr.(*dns.RRSIG); ok && sig.TypeCovered == dns.TypeDS {
+				dsSigner := strings.ToLower(dns.Fqdn(sig.SignerName))
+				if dsSigner != last.zone {
+					dbg("validate: DS signer %q ≠ last zone %q — interpolating intermediate zone(s)", dsSigner, last.zone)
+					intKeys, intSteps, intOK := validateIntermediateZones(last.zone, dsSigner, last.ns, keys)
+					extraSteps = append(extraSteps, intSteps...)
+					if !intOK {
+						extraSteps[dsStepIdx].StepNote += fmt.Sprintf(" — intermediate zone %s validation failed (BOGUS)", dsSigner)
+						return false, extraSteps
+					}
+					keysForDS = intKeys
+				}
+				break
+			}
+		}
+
+		if !callerSuppliedDS && !verifyDSRRSigInAnswer(dsResp.Answer, keysForDS) {
 			dbg("validate: DS RRSIG in answer failed for %s → BOGUS", signerZone)
-			dsStep.StepNote += " — DS RRSIG failed (BOGUS)"
+			extraSteps[dsStepIdx].StepNote += " — DS RRSIG failed (BOGUS)"
 			return false, extraSteps
 		}
 		if !callerSuppliedDS {
 			dbg("validate: DS RRSIG OK for %s", signerZone)
-			dsStep.StepNote += " — DS sig OK"
+			extraSteps[dsStepIdx].StepNote += " — DS sig OK"
 		}
 
 		childKeyResp, childKeyStep := fetchDNSKEYResponse(signerZone, last.ns)
@@ -638,7 +830,14 @@ func validateChainOfTrust(chain []ResolutionStep, req *QueryRequest) (interface{
 			return false, extraSteps
 		}
 		childKeyStep.StepNote += " — DS match OK"
-		if !verifyDNSKEYRRSig(childKeys, childKeyResp) {
+		if err := verifyDNSKEYRRSig(childKeys, childKeyResp); err != nil {
+			if err == dns.ErrAlg {
+				algName := dnsKeyAlgName(childKeys)
+				dbg("validate: child DNSKEY self-sig for %s uses unsupported algorithm %s — indeterminate", signerZone, algName)
+				childKeyStep.StepNote += fmt.Sprintf(", DNSKEY self-signature uses unsupported algorithm %s (algorithm %d) — indeterminate", algName, childKeys[0].Algorithm)
+				extraSteps = append(extraSteps, childKeyStep)
+				return "indeterminate", extraSteps
+			}
 			dbg("validate: child DNSKEY self-sig failed for %s → BOGUS", signerZone)
 			childKeyStep.StepNote += ", DNSKEY self-signature failed (BOGUS)"
 			extraSteps = append(extraSteps, childKeyStep)
@@ -701,6 +900,7 @@ func validateChainOfTrust(chain []ResolutionStep, req *QueryRequest) (interface{
 			continue
 		}
 		sigOK := false
+		algUnsupported := false
 		for _, key := range keys {
 			if key.KeyTag() == sig.KeyTag {
 				err := verifySig(sig, key, rrset)
@@ -709,11 +909,28 @@ func validateChainOfTrust(chain []ResolutionStep, req *QueryRequest) (interface{
 					sigOK = true
 					break
 				}
+				if err == dns.ErrAlg {
+					algUnsupported = true
+				}
 			}
 		}
 		if !sigOK {
-			dbg("validate: RRSIG(%s) at %s could not be verified → BOGUS", dns.TypeToString[sig.TypeCovered], sig.Hdr.Name)
 			verifyStep := verifyStepBase
+			if algUnsupported {
+				algName := dns.AlgorithmToString[sig.Algorithm]
+				if algName == "" {
+					algName = fmt.Sprintf("algorithm %d", sig.Algorithm)
+				}
+				dbg("validate: RRSIG(%s) at %s uses unsupported algorithm %s — indeterminate", dns.TypeToString[sig.TypeCovered], sig.Hdr.Name, algName)
+				verifyStep.StepNote = fmt.Sprintf("RRSIG(%s) at %s uses %s (algorithm %d) which is not supported by this validator — indeterminate",
+					dns.TypeToString[sig.TypeCovered], sig.Hdr.Name, algName, sig.Algorithm)
+				verifyStep.ResponseText = fmt.Sprintf("; %s\n\n%s", verifyStep.StepNote, last.resp.String())
+				if b, packErr := last.resp.Pack(); packErr == nil {
+					verifyStep.ResponseBytesHex = hex.EncodeToString(b)
+				}
+				return "indeterminate", append(extraSteps, verifyStep)
+			}
+			dbg("validate: RRSIG(%s) at %s could not be verified → BOGUS", dns.TypeToString[sig.TypeCovered], sig.Hdr.Name)
 			verifyStep.StepNote = fmt.Sprintf("RRSIG(%s) at %s could not be verified — BOGUS", dns.TypeToString[sig.TypeCovered], sig.Hdr.Name)
 			verifyStep.ResponseText = fmt.Sprintf("; RRSIG(%s) at %s could not be verified.\n; Result: BOGUS\n\n%s",
 				dns.TypeToString[sig.TypeCovered], sig.Hdr.Name, last.resp.String())
@@ -759,6 +976,15 @@ func validateChainOfTrust(chain []ResolutionStep, req *QueryRequest) (interface{
 			qtype != dns.TypeANY)
 	isWildcard := !isDenial && isWildcardAnswer(last.resp)
 
+	// When the authoritative server returns NXDOMAIN and also includes a CNAME in
+	// the answer section, the NXDOMAIN applies to the CNAME target (the owner name
+	// exists — it has a CNAME — but the target does not). The NSEC/NSEC3 denial
+	// records cover the target, so use that as the proof name, not req.QName.
+	denialName := dns.Fqdn(req.QName)
+	if last.resp.Rcode == dns.RcodeNameError {
+		denialName = cnameChainTarget(last.resp.Answer, denialName)
+	}
+
 	var denialNote string
 	if isDenial || isWildcard {
 		nsecs, nsec3s := extractDenialRRs(last.resp.Ns)
@@ -768,9 +994,9 @@ func validateChainOfTrust(chain []ResolutionStep, req *QueryRequest) (interface{
 		case isWildcard:
 			denialOK, denialNote = verifyWildcardNextCloser(dns.Fqdn(req.QName), last.resp)
 		case len(nsec3s) > 0:
-			denialOK, denialNote = verifyNSEC3Denial(dns.Fqdn(req.QName), qtype, last.resp.Rcode, nsec3s)
+			denialOK, denialNote = verifyNSEC3Denial(denialName, qtype, last.resp.Rcode, nsec3s)
 		case len(nsecs) > 0:
-			denialOK, denialNote = verifyNSECDenial(dns.Fqdn(req.QName), qtype, last.resp.Rcode, nsecs)
+			denialOK, denialNote = verifyNSECDenial(denialName, qtype, last.resp.Rcode, nsecs)
 		default:
 			denialOK = false
 			denialNote = "no NSEC or NSEC3 records in authority section"
@@ -818,7 +1044,25 @@ func validateChainOfTrust(chain []ResolutionStep, req *QueryRequest) (interface{
 	if b, packErr := last.resp.Pack(); packErr == nil {
 		verifyStep.ResponseBytesHex = hex.EncodeToString(b)
 	}
-	return true, append(extraSteps, verifyStep)
+	extraSteps = append(extraSteps, verifyStep)
+
+	// If the final answer is a cross-zone CNAME, also validate the CNAME target's
+	// chain. The iterative resolver restarts from root for the target, appending
+	// those steps after the CNAME step. We validate them separately and return the
+	// weaker of the two results: a secure CNAME pointing to an insecure zone is
+	// insecure overall, and bogus beats everything.
+	if last.resp.Rcode == dns.RcodeSuccess && isCNAMEOnlyAnswer(last.resp.Answer) &&
+		lastChainIdx >= 0 && lastChainIdx < len(chain)-1 {
+		targetName := cnameChainTarget(last.resp.Answer, dns.Fqdn(req.QName))
+		dbg("validate: CNAME to %s — validating target chain (steps %d–%d)", targetName, lastChainIdx+1, len(chain)-1)
+		targetReq := *req
+		targetReq.QName = targetName
+		targetResult, targetSteps := validateChainOfTrust(chain[lastChainIdx+1:], &targetReq)
+		extraSteps = append(extraSteps, targetSteps...)
+		return weakerValidationResult(true, targetResult), extraSteps
+	}
+
+	return true, extraSteps
 }
 
 // convertTrustAnchors converts the request's TrustAnchorDS list to dns.DS records
@@ -1047,10 +1291,11 @@ func verifySig(sig *dns.RRSIG, key *dns.DNSKEY, rrset []dns.RR) error {
 	return sig.Verify(key, rrset)
 }
 
-// verifyDNSKEYRRSig returns true if the DNSKEY RRset in keyResp has a valid
-// self-signature from the zone's KSK. Returns true when no RRSIG is present
-// (the DS check already proved the key is trusted).
-func verifyDNSKEYRRSig(keys []*dns.DNSKEY, keyResp *dns.Msg) bool {
+// verifyDNSKEYRRSig verifies the DNSKEY RRset self-signature in keyResp.
+// Returns nil on success, dns.ErrAlg if the signing algorithm is not supported
+// by this library, or a non-nil error for any other failure.
+// Returns nil when no RRSIG is present (DS match already proved the key trusted).
+func verifyDNSKEYRRSig(keys []*dns.DNSKEY, keyResp *dns.Msg) error {
 	var rrsigs []*dns.RRSIG
 	var keyRRs []dns.RR
 	for _, rr := range keyResp.Answer {
@@ -1064,18 +1309,26 @@ func verifyDNSKEYRRSig(keys []*dns.DNSKEY, keyResp *dns.Msg) bool {
 		}
 	}
 	if len(rrsigs) == 0 {
-		return true
+		return nil
 	}
+	algUnsupported := false
 	for _, sig := range rrsigs {
 		for _, key := range keys {
 			if key.KeyTag() == sig.KeyTag {
-				if err := verifySig(sig, key, keyRRs); err == nil {
-					return true
+				err := verifySig(sig, key, keyRRs)
+				if err == nil {
+					return nil
+				}
+				if err == dns.ErrAlg {
+					algUnsupported = true
 				}
 			}
 		}
 	}
-	return false
+	if algUnsupported {
+		return dns.ErrAlg
+	}
+	return fmt.Errorf("DNSKEY self-signature failed")
 }
 
 // verifyDSRRSig returns true if the DS records in the parent's authority section
@@ -1181,8 +1434,12 @@ func validateIntermediateZones(parentZone, signerZone string, ns namedAddr, pare
 			keyStep.StepNote += " — DNSKEY does not match DS (BOGUS)"
 			return nil, extraSteps, false
 		}
-		if !verifyDNSKEYRRSig(keys, keyResp) {
-			keyStep.StepNote += " — DNSKEY self-signature failed (BOGUS)"
+		if err := verifyDNSKEYRRSig(keys, keyResp); err != nil {
+			if err == dns.ErrAlg {
+				keyStep.StepNote += fmt.Sprintf(" — DNSKEY self-signature uses unsupported algorithm %s — indeterminate", dnsKeyAlgName(keys))
+			} else {
+				keyStep.StepNote += " — DNSKEY self-signature failed (BOGUS)"
+			}
 			return nil, extraSteps, false
 		}
 		keyStep.StepNote += " — DS match OK, self-sig OK"
@@ -1756,6 +2013,71 @@ func extractCNAME(answers []dns.RR, target string) string {
 	return ""
 }
 
+// cnameChainTarget follows the CNAME chain in ans starting from start and
+// returns the final target name (FQDN). Returns start unchanged if no CNAME
+// is found. Guards against infinite loops with a step limit.
+func cnameChainTarget(ans []dns.RR, start string) string {
+	name := start
+	for range 16 {
+		found := false
+		for _, rr := range ans {
+			if cn, ok := rr.(*dns.CNAME); ok &&
+				strings.EqualFold(dns.Fqdn(cn.Hdr.Name), name) {
+				name = dns.Fqdn(cn.Target)
+				found = true
+				break
+			}
+		}
+		if !found {
+			break
+		}
+	}
+	return name
+}
+
+// dnsKeyAlgName returns the algorithm name string for the first key in the
+// slice, or "unknown" if the slice is empty or the algorithm has no name.
+func dnsKeyAlgName(keys []*dns.DNSKEY) string {
+	if len(keys) == 0 {
+		return "unknown"
+	}
+	if name := dns.AlgorithmToString[keys[0].Algorithm]; name != "" {
+		return fmt.Sprintf("%s (algorithm %d)", name, keys[0].Algorithm)
+	}
+	return fmt.Sprintf("algorithm %d", keys[0].Algorithm)
+}
+
+// isCNAMEOnlyAnswer returns true when every non-RRSIG record in ans is a CNAME,
+// indicating a cross-zone CNAME redirection rather than a final typed answer.
+func isCNAMEOnlyAnswer(ans []dns.RR) bool {
+	if len(ans) == 0 {
+		return false
+	}
+	for _, rr := range ans {
+		t := rr.Header().Rrtype
+		if t != dns.TypeCNAME && t != dns.TypeRRSIG {
+			return false
+		}
+	}
+	return true
+}
+
+// weakerValidationResult returns the less secure of two validation outcomes.
+// Priority (strongest to weakest): true > "insecure" > "indeterminate" > false.
+// A bogus result in any part of a CNAME chain makes the whole chain bogus.
+func weakerValidationResult(a, b interface{}) interface{} {
+	if a == false || b == false {
+		return false
+	}
+	if a == "indeterminate" || b == "indeterminate" {
+		return "indeterminate"
+	}
+	if a == "insecure" || b == "insecure" {
+		return "insecure"
+	}
+	return true
+}
+
 func extractGlue(extra []dns.RR) map[string]string {
 	m := make(map[string]string)
 	for _, rr := range extra {
@@ -1803,6 +2125,21 @@ func extractFirstNSName(ns []dns.RR) string {
 		}
 	}
 	return ""
+}
+
+func extractAllNSNames(ns []dns.RR) []string {
+	var names []string
+	seen := map[string]bool{}
+	for _, rr := range ns {
+		if nsrr, ok := rr.(*dns.NS); ok {
+			key := strings.ToLower(nsrr.Ns)
+			if !seen[key] {
+				names = append(names, nsrr.Ns)
+				seen[key] = true
+			}
+		}
+	}
+	return names
 }
 
 // resolveNSAddr resolves an NS hostname to A addresses, preserving the name.
