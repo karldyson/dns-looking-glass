@@ -10,14 +10,19 @@ type TrustAnchorDS struct {
 	Digest     string `json:"digest"` // uppercase hex
 }
 
-// ZoneTrustAnchor lets callers supply DS records for a specific zone that does
-// not yet have DS published in the parent (e.g. pre-publication signing tests).
-// When provided, validation proceeds as normal using the supplied DS records in
-// place of the parent-published DS. The step note will indicate that a
-// caller-supplied trust anchor was used.
+// ZoneTrustAnchor lets callers supply DS records for a specific zone to test
+// pre-publication scenarios without the DS being in the parent zone yet.
+//
+// Override controls how the caller-supplied DS interacts with the parent DS:
+//   - false (default/omitted): add mode — caller DS is accepted alongside any
+//     parent-published DS; useful for testing that a new KSK won't break resolution.
+//   - true: replace mode — caller DS replaces whatever the parent publishes; the
+//     DS RRSIG check against the parent is skipped; useful for testing a complete
+//     DS swap before the change is made.
 type ZoneTrustAnchor struct {
-	Zone string          `json:"zone"` // zone name, e.g. "example.com."
-	DS   []TrustAnchorDS `json:"ds"`   // DS records to use as trust anchor
+	Zone     string          `json:"zone"`               // zone name, e.g. "example.com."
+	DS       []TrustAnchorDS `json:"ds"`                 // DS records to use as trust anchor
+	Override bool            `json:"override,omitempty"` // true = replace parent DS; false = add alongside
 }
 
 // QueryRequest is the JSON body received on POST /.

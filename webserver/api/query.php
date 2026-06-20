@@ -99,6 +99,34 @@ $payload = [
     'trust_anchors'     => $req['trust_anchors'] ?? [],
 ];
 
+// Validate and sanitise caller-supplied per-zone DS overrides.
+$ztas = [];
+foreach (($req['zone_trust_anchors'] ?? []) as $zta) {
+    if (!isset($zta['zone'], $zta['ds']) || !is_array($zta['ds'])) {
+        continue;
+    }
+    $sanitisedDS = [];
+    foreach ($zta['ds'] as $ds) {
+        if (!isset($ds['key_tag'], $ds['algorithm'], $ds['digest_type'], $ds['digest'])) {
+            continue;
+        }
+        $sanitisedDS[] = [
+            'key_tag'     => (int)$ds['key_tag'],
+            'algorithm'   => (int)$ds['algorithm'],
+            'digest_type' => (int)$ds['digest_type'],
+            'digest'      => strtoupper(preg_replace('/[^0-9a-fA-F]/', '', (string)$ds['digest'])),
+        ];
+    }
+    if (count($sanitisedDS) > 0) {
+        $ztas[] = [
+            'zone'     => (string)$zta['zone'],
+            'ds'       => $sanitisedDS,
+            'override' => (bool)($zta['override'] ?? false),
+        ];
+    }
+}
+$payload['zone_trust_anchors'] = $ztas;
+
 $apiStart = microtime(true);
 $result   = postJSON($apiUrl, $payload);
 $apiMs    = round((microtime(true) - $apiStart) * 1000, 2);
