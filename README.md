@@ -84,7 +84,7 @@ cp dnslg-config.example.json /var/www/html/dnslg/dnslg-config.json
 $EDITOR /var/www/html/dnslg/dnslg-config.json
 ```
 
-The config file must be in the same directory as `api/config.php` and `api/query.php` (one level up from `api/`).
+The config file lives in the webserver root — the same directory as `index.html`, one level above `api/`. The PHP files resolve it as `__DIR__ . '/../dnslg-config.json'`.
 
 **Apache** — the supplied `.htaccess` blocks direct HTTP access to `dnslg-config.json`. Ensure `AllowOverride` is enabled for the directory.
 
