@@ -404,6 +404,82 @@ input[type="text"].error { border-color: var(--color-error); }
 .radio-label-inline input[type="radio"] { margin: 0; }
 .radio-label-inline small { color: var(--color-text-muted, #6b7280); }
 
+/* ── DS override UI ──────────────────────────────────────────────────────────── */
+.ds-overrides-section {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  margin-top: 0.25rem;
+  padding-top: 0.5rem;
+  border-top: 1px solid var(--color-border-light, #e5e7eb);
+}
+.ds-overrides-header {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+.btn-inline {
+  font-family: inherit;
+  font-size: 0.8125rem;
+  font-weight: 500;
+  padding: 0.2rem 0.6rem;
+  border: 1px solid var(--color-border, #d1d5db);
+  border-radius: 4px;
+  background: var(--color-bg, #fff);
+  color: var(--color-text, #111827);
+  cursor: pointer;
+  line-height: 1.4;
+}
+.btn-inline:hover { background: var(--color-bg-alt, #f3f4f6); }
+.ds-override-row {
+  display: grid;
+  grid-template-columns: minmax(8rem, 14rem) 1fr auto auto;
+  gap: 0.4rem;
+  align-items: start;
+}
+.ds-zone {
+  font-family: var(--font-mono, monospace);
+  font-size: 0.8125rem;
+  padding: 0.3rem 0.5rem;
+  border: 1px solid var(--color-border, #d1d5db);
+  border-radius: 4px;
+  background: var(--color-bg, #fff);
+}
+.ds-text {
+  font-family: var(--font-mono, monospace);
+  font-size: 0.75rem;
+  padding: 0.3rem 0.5rem;
+  border: 1px solid var(--color-border, #d1d5db);
+  border-radius: 4px;
+  background: var(--color-bg, #fff);
+  resize: vertical;
+  min-height: 2.6rem;
+  line-height: 1.4;
+}
+.ds-mode {
+  font-family: inherit;
+  font-size: 0.8125rem;
+  padding: 0.3rem 0.4rem;
+  border: 1px solid var(--color-border, #d1d5db);
+  border-radius: 4px;
+  background: var(--color-bg, #fff);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.ds-remove {
+  font-size: 1rem;
+  line-height: 1;
+  padding: 0.25rem 0.5rem;
+  border: 1px solid var(--color-border, #d1d5db);
+  border-radius: 4px;
+  background: var(--color-bg, #fff);
+  color: var(--color-text-muted, #6b7280);
+  cursor: pointer;
+  align-self: start;
+}
+.ds-remove:hover { background: var(--color-danger-bg, #fee2e2); color: var(--color-danger, #dc2626); border-color: var(--color-danger, #dc2626); }
+
 /* ── Packet visualiser ───────────────────────────────────────────────────── */
 .packet-section { display: flex; flex-direction: column; gap: 0.625rem; }
 .packet-title { font-size: 0.8125rem; font-weight: 600; color: var(--color-text-muted); text-transform: uppercase; letter-spacing: 0.05em; }

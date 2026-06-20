@@ -220,6 +220,13 @@ type zoneLevel struct {
 	resp *dns.Msg  // response received at this level
 }
 
+// callerDSEntry holds caller-supplied DS records for a zone and whether they
+// should replace (override=true) or supplement (override=false) the parent DS.
+type callerDSEntry struct {
+	ds      []*dns.DS
+	replace bool
+}
+
 // parseDelegationChain converts the resolution step list into a sequence of zone
 // levels. Each level carries the zone name, its authoritative NS, the DS records
 // the parent provided, and the parsed response. DO must have been set during
@@ -300,14 +307,31 @@ func validateChainOfTrust(chain []ResolutionStep, req *QueryRequest) (interface{
 	var extraSteps []ResolutionStep
 	validatedKeys := make(map[string][]*dns.DNSKEY) // zone → trusted key set
 
-	// Inject caller-supplied DS records into delegation levels that have no parent DS.
-	// This allows validation of zones whose DS hasn't been published yet.
+	// Build a lookup map of caller-supplied DS records per zone. This supports two
+	// modes: replace (override=true) swaps the parent DS entirely (DS RRSIG check
+	// skipped); add (override=false, default) supplements the parent DS so both the
+	// old and new keys are accepted during DNSKEY matching.
+	callerDSMap := map[string]callerDSEntry{}
+	for _, zta := range req.ZoneTrustAnchors {
+		zone := strings.ToLower(dns.Fqdn(zta.Zone))
+		callerDSMap[zone] = callerDSEntry{ds: convertZoneDS(zta.Zone, zta.DS), replace: zta.Override}
+	}
+
+	// Inject caller-supplied DS into delegation levels. For replace mode or zones
+	// with no parent DS, overwrite level.ds. Add mode with existing parent DS is
+	// handled inline in the main loop so the original DS is preserved for RRSIG checks.
 	for i, level := range levels {
-		if level.zone != "." && len(level.ds) == 0 {
-			if zta := findZoneTrustAnchor(req, level.zone); len(zta) > 0 {
-				levels[i].ds = convertZoneDS(level.zone, zta)
-				dbg("validate: injected %d caller-supplied DS record(s) for %s at level %d", len(zta), level.zone, i)
-			}
+		if level.zone == "." {
+			continue
+		}
+		zone := strings.ToLower(dns.Fqdn(level.zone))
+		entry, ok := callerDSMap[zone]
+		if !ok {
+			continue
+		}
+		if entry.replace || len(level.ds) == 0 {
+			levels[i].ds = entry.ds
+			dbg("validate: injected %d caller-supplied DS for %s (replace=%v)", len(entry.ds), level.zone, entry.replace)
 		}
 	}
 
@@ -399,20 +423,35 @@ func validateChainOfTrust(chain []ResolutionStep, req *QueryRequest) (interface{
 				return "indeterminate", extraSteps
 			}
 		} else {
-			dbg("validate: checking %d DNSKEY(s) against %d DS record(s) for %s", len(keys), len(level.ds), level.zone)
+			// For add mode, supplement the parent DS with caller-supplied DS for key matching.
+			// level.ds already reflects replace mode from the pre-injection loop above.
+			dsForMatch := level.ds
+			levelZone := strings.ToLower(dns.Fqdn(level.zone))
+			callerEntry, hasCallerDS := callerDSMap[levelZone]
+			if hasCallerDS && !callerEntry.replace && len(level.ds) > 0 {
+				dsForMatch = append(append([]*dns.DS{}, level.ds...), callerEntry.ds...)
+				dbg("validate: add mode — supplementing %d parent DS with %d caller-supplied DS for %s", len(level.ds), len(callerEntry.ds), level.zone)
+			}
+			dbg("validate: checking %d DNSKEY(s) against %d DS record(s) for %s", len(keys), len(dsForMatch), level.zone)
 			if Debug {
-				for _, ds := range level.ds {
+				for _, ds := range dsForMatch {
 					dbg("validate:   DS tag=%d alg=%d dtype=%d digest=%.16s…", ds.KeyTag, ds.Algorithm, ds.DigestType, ds.Digest)
 				}
 			}
-			if !anyKeyMatchesDS(keys, level.ds) {
+			if !anyKeyMatchesDS(keys, dsForMatch) {
 				dbg("validate: no DNSKEY matches DS for %s → BOGUS", level.zone)
 				step.StepNote += " — DNSKEY does not match parent DS records (BOGUS)"
 				extraSteps = append(extraSteps, step)
 				return false, extraSteps
 			}
 			dbg("validate: DS match OK for %s", level.zone)
-			step.StepNote += " — DS match OK"
+			if hasCallerDS && !callerEntry.replace && len(level.ds) > 0 {
+				step.StepNote += fmt.Sprintf(" — DS match OK (+ %d caller-supplied DS, add mode)", len(callerEntry.ds))
+			} else if hasCallerDS && callerEntry.replace {
+				step.StepNote += " — DS match OK (caller-supplied override)"
+			} else {
+				step.StepNote += " — DS match OK"
+			}
 		}
 
 		if !verifyDNSKEYRRSig(keys, keyResp) {
@@ -425,31 +464,39 @@ func validateChainOfTrust(chain []ResolutionStep, req *QueryRequest) (interface{
 		step.StepNote += ", self-sig OK"
 
 		if i < len(levels)-1 && len(levels[i+1].ds) > 0 {
-			dbg("validate: verifying DS RRSIG for child zone %s", levels[i+1].zone)
-			keysForDS := keys
-			if signer := dsRRSigSigner(level.resp); signer != "" && signer != level.zone {
-				// The DS was signed by an intermediate zone not present in the referral
-				// chain (e.g. uk. and co.uk. share nameservers so the uk. server returns
-				// the junesta.co.uk. DS signed by co.uk.'s ZSK directly).
-				dbg("validate: DS signer %q ≠ current zone %q — interpolating intermediate zone(s)", signer, level.zone)
-				intKeys, intSteps, intOK := validateIntermediateZones(level.zone, signer, level.ns, keys)
-				extraSteps = append(extraSteps, intSteps...)
-				if !intOK {
-					step.StepNote += fmt.Sprintf(", intermediate zone %s validation failed (BOGUS)", signer)
+			childZoneKey := strings.ToLower(dns.Fqdn(levels[i+1].zone))
+			childCallerEntry, childHasCallerDS := callerDSMap[childZoneKey]
+			if childHasCallerDS && childCallerEntry.replace {
+				// DS was replaced by caller — no parent RRSIG exists for it.
+				dbg("validate: child zone %s has caller-supplied DS override — skipping DS RRSIG check", levels[i+1].zone)
+				step.StepNote += " — child DS is caller-supplied override (RRSIG check skipped)"
+			} else {
+				dbg("validate: verifying DS RRSIG for child zone %s", levels[i+1].zone)
+				keysForDS := keys
+				if signer := dsRRSigSigner(level.resp); signer != "" && signer != level.zone {
+					// The DS was signed by an intermediate zone not present in the referral
+					// chain (e.g. uk. and co.uk. share nameservers so the uk. server returns
+					// the junesta.co.uk. DS signed by co.uk.'s ZSK directly).
+					dbg("validate: DS signer %q ≠ current zone %q — interpolating intermediate zone(s)", signer, level.zone)
+					intKeys, intSteps, intOK := validateIntermediateZones(level.zone, signer, level.ns, keys)
+					extraSteps = append(extraSteps, intSteps...)
+					if !intOK {
+						step.StepNote += fmt.Sprintf(", intermediate zone %s validation failed (BOGUS)", signer)
+						extraSteps = append(extraSteps, step)
+						return false, extraSteps
+					}
+					keysForDS = intKeys
+					validatedKeys[signer] = intKeys
+				}
+				if !verifyDSRRSig(levels[i+1].ds, level.resp, keysForDS) {
+					dbg("validate: DS RRSIG failed for child %s → BOGUS", levels[i+1].zone)
+					step.StepNote += ", DS signature for child zone failed (BOGUS)"
 					extraSteps = append(extraSteps, step)
 					return false, extraSteps
 				}
-				keysForDS = intKeys
-				validatedKeys[signer] = intKeys
+				dbg("validate: DS RRSIG OK for child %s", levels[i+1].zone)
+				step.StepNote += ", child DS sig OK"
 			}
-			if !verifyDSRRSig(levels[i+1].ds, level.resp, keysForDS) {
-				dbg("validate: DS RRSIG failed for child %s → BOGUS", levels[i+1].zone)
-				step.StepNote += ", DS signature for child zone failed (BOGUS)"
-				extraSteps = append(extraSteps, step)
-				return false, extraSteps
-			}
-			dbg("validate: DS RRSIG OK for child %s", levels[i+1].zone)
-			step.StepNote += ", child DS sig OK"
 		}
 
 		extraSteps = append(extraSteps, step)
@@ -520,15 +567,26 @@ func validateChainOfTrust(chain []ResolutionStep, req *QueryRequest) (interface{
 		}
 		dbg("validate: got %d DS record(s) for %s", len(childDS), signerZone)
 
+		signerZoneNorm := strings.ToLower(dns.Fqdn(signerZone))
 		callerSuppliedDS := false
-		if len(childDS) == 0 {
-			if zta := findZoneTrustAnchor(req, signerZone); len(zta) > 0 {
-				// Caller supplied DS records for this zone — use them as trust anchor.
-				childDS = convertZoneDS(signerZone, zta)
+		dsForChildMatch := childDS // default: use whatever was fetched from parent
+
+		if entry, ok := callerDSMap[signerZoneNorm]; ok && entry.replace {
+			// Replace mode: use caller-supplied DS regardless of what parent returns.
+			// The parent's DS RRSIG is skipped because it doesn't cover our new DS.
+			dsForChildMatch = entry.ds
+			callerSuppliedDS = true
+			dbg("validate: using %d caller-supplied DS for %s (replace mode)", len(entry.ds), signerZone)
+			extraSteps[len(extraSteps)-1].StepNote += fmt.Sprintf(
+				" — caller-supplied DS override (%d record(s)) replaces parent; RRSIG check skipped", len(entry.ds))
+		} else if len(childDS) == 0 {
+			if entry, ok := callerDSMap[signerZoneNorm]; ok {
+				// No parent DS at all — use caller-supplied (add and replace behave the same).
+				dsForChildMatch = entry.ds
 				callerSuppliedDS = true
-				dbg("validate: using %d caller-supplied DS record(s) for %s", len(childDS), signerZone)
+				dbg("validate: using %d caller-supplied DS for %s (no parent DS)", len(entry.ds), signerZone)
 				extraSteps[len(extraSteps)-1].StepNote += fmt.Sprintf(
-					" — no DS in parent; using caller-supplied trust anchor (%d DS record(s))", len(childDS))
+					" — no DS in parent; using caller-supplied trust anchor (%d DS record(s))", len(entry.ds))
 			} else if dsResp.Rcode == dns.RcodeSuccess {
 				// NOERROR with no DS means the parent explicitly has no DS for this
 				// zone — unsigned delegation (RFC 4035 §5.2).
@@ -539,6 +597,13 @@ func validateChainOfTrust(chain []ResolutionStep, req *QueryRequest) (interface{
 			} else {
 				return "indeterminate", extraSteps
 			}
+		} else if entry, ok := callerDSMap[signerZoneNorm]; ok && !entry.replace {
+			// Add mode: parent DS fetched successfully — supplement it with caller DS.
+			// The parent DS RRSIG is still verified (it covers the original DS set only).
+			dsForChildMatch = append(append([]*dns.DS{}, childDS...), entry.ds...)
+			dbg("validate: supplementing %d parent DS with %d caller-supplied DS for %s (add mode)", len(childDS), len(entry.ds), signerZone)
+			extraSteps[len(extraSteps)-1].StepNote += fmt.Sprintf(
+				" — + %d caller-supplied DS (add mode, RRSIG covers parent DS only)", len(entry.ds))
 		}
 
 		if !callerSuppliedDS && !verifyDSRRSigInAnswer(dsResp.Answer, keys) {
@@ -546,8 +611,10 @@ func validateChainOfTrust(chain []ResolutionStep, req *QueryRequest) (interface{
 			dsStep.StepNote += " — DS RRSIG failed (BOGUS)"
 			return false, extraSteps
 		}
-		dbg("validate: DS RRSIG OK for %s", signerZone)
-		dsStep.StepNote += " — DS sig OK"
+		if !callerSuppliedDS {
+			dbg("validate: DS RRSIG OK for %s", signerZone)
+			dsStep.StepNote += " — DS sig OK"
+		}
 
 		childKeyResp, childKeyStep := fetchDNSKEYResponse(signerZone, last.ns)
 		childKeyStep.StepNote = fmt.Sprintf("Validating %s DNSKEY", signerZone)
@@ -564,7 +631,7 @@ func validateChainOfTrust(chain []ResolutionStep, req *QueryRequest) (interface{
 			extraSteps = append(extraSteps, childKeyStep)
 			return "indeterminate", extraSteps
 		}
-		if !anyKeyMatchesDS(childKeys, childDS) {
+		if !anyKeyMatchesDS(childKeys, dsForChildMatch) {
 			dbg("validate: child DNSKEY does not match DS for %s → BOGUS", signerZone)
 			childKeyStep.StepNote += " — DNSKEY does not match DS (BOGUS)"
 			extraSteps = append(extraSteps, childKeyStep)

@@ -156,6 +156,9 @@ function wireFormBehaviours() {
   // Validate checkbox — show/hide anchor mode selector.
   document.getElementById('flag-validate').addEventListener('change', updateValidateState);
 
+  // DS override — add row when button clicked.
+  document.getElementById('add-ds-override').addEventListener('click', addDSOverride);
+
   // TCP — disable EDNS UDP size when TCP is selected.
   document.querySelectorAll('input[name="use_tcp"]').forEach(r => {
     r.addEventListener('change', onProtocolChange);
@@ -180,6 +183,39 @@ function onModeChange() {
   }
 
   updateValidateState();
+}
+
+// ── DS override helpers ───────────────────────────────────────────────────────
+
+// Parse a DS record from either full zone-file format or bare RDATA.
+// Accepts: "12345 13 2 ABCD..." or "zone. TTL IN DS 12345 13 2 ABCD..."
+// Digest hex may contain whitespace (multi-line zone-file continuation).
+function parseDSRecord(text) {
+  const m = text.trim().match(/(?:.*?\s+IN\s+DS\s+)?(\d+)\s+(\d+)\s+(\d+)\s+([0-9a-fA-F][0-9a-fA-F\s]*)/i);
+  if (!m) return null;
+  return {
+    key_tag:     +m[1],
+    algorithm:   +m[2],
+    digest_type: +m[3],
+    digest:      m[4].replace(/\s+/g, '').toUpperCase(),
+  };
+}
+
+function addDSOverride() {
+  const list = document.getElementById('ds-override-list');
+  const row = document.createElement('div');
+  row.className = 'ds-override-row';
+  row.innerHTML =
+    '<input type="text" class="ds-zone" placeholder="example.com." spellcheck="false" autocapitalize="off" autocomplete="off">' +
+    '<textarea class="ds-text" rows="2" placeholder="12345 13 2 ABCDEF…&#10;(paste DS RDATA or full DS record line)" spellcheck="false"></textarea>' +
+    '<select class="ds-mode">' +
+      '<option value="add">Add alongside parent DS</option>' +
+      '<option value="replace">Replace parent DS entirely</option>' +
+    '</select>' +
+    '<button type="button" class="ds-remove" aria-label="Remove DS override">×</button>';
+  row.querySelector('.ds-remove').addEventListener('click', () => row.remove());
+  list.appendChild(row);
+  row.querySelector('.ds-zone').focus();
 }
 
 function updateValidateState() {
@@ -330,9 +366,30 @@ function buildPayload(qname) {
         : 0,
       options: ednsOptions,
     },
-    trust_anchor_mode: anchorMode,
-    trust_anchors:     (validateChecked && anchorMode === 'iana') ? (config?.trust_anchors || []) : [],
+    trust_anchor_mode:  anchorMode,
+    trust_anchors:      (validateChecked && anchorMode === 'iana') ? (config?.trust_anchors || []) : [],
+    zone_trust_anchors: collectDSOverrides(validateChecked),
   };
+}
+
+function collectDSOverrides(validateActive) {
+  if (!validateActive) return [];
+  const overrides = [];
+  document.querySelectorAll('.ds-override-row').forEach(row => {
+    const zone = row.querySelector('.ds-zone').value.trim();
+    const override = row.querySelector('.ds-mode').value === 'replace';
+    const ds = [];
+    row.querySelector('.ds-text').value.split('\n').forEach(line => {
+      if (line.trim()) {
+        const parsed = parseDSRecord(line);
+        if (parsed) ds.push(parsed);
+      }
+    });
+    if (zone && ds.length > 0) {
+      overrides.push({ zone, ds, override });
+    }
+  });
+  return overrides;
 }
 
 async function queryNode(tag, nodeName, payload) {

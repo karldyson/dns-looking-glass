@@ -1332,3 +1332,86 @@ func TestIntegration_NoValidation(t *testing.T) {
 		t.Errorf("DNSSECValid: want nil when Validate=false, got %v", resp.DNSSECValid)
 	}
 }
+
+// TestIntegration_DSAdd verifies that supplying a correct caller DS for a zone
+// that already has a parent-published DS (add mode, override=false) still
+// produces SECURE — the caller DS is redundant but harmless.
+func TestIntegration_DSAdd(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping network integration tests (-short)")
+	}
+
+	// First fetch the real DS for junesta.net. from its parent zone.
+	msg := new(dns.Msg)
+	msg.SetQuestion("junesta.net.", dns.TypeDS)
+	msg.SetEdns0(1232, true)
+	c := &dns.Client{Net: "udp", Timeout: 5 * time.Second}
+	// Query one of the .net nameservers.
+	var dsRecords []TrustAnchorDS
+	netNS := []string{"a.gtld-servers.net:53", "b.gtld-servers.net:53"}
+	for _, ns := range netNS {
+		r, _, err := c.Exchange(msg, ns)
+		if err != nil || r == nil {
+			continue
+		}
+		for _, rr := range r.Ns {
+			if ds, ok := rr.(*dns.DS); ok {
+				dsRecords = append(dsRecords, TrustAnchorDS{
+					KeyTag:     ds.KeyTag,
+					Algorithm:  ds.Algorithm,
+					DigestType: ds.DigestType,
+					Digest:     strings.ToUpper(ds.Digest),
+				})
+			}
+		}
+		if len(dsRecords) > 0 {
+			break
+		}
+	}
+	if len(dsRecords) == 0 {
+		t.Skip("could not fetch junesta.net DS from parent — skipping")
+	}
+
+	req := &QueryRequest{
+		QName:            "junesta.net.",
+		QType:            "SOA",
+		Mode:             "recursive",
+		Flags:            QueryFlags{DO: true, Validate: true},
+		TrustAnchorMode:  "iana",
+		ZoneTrustAnchors: []ZoneTrustAnchor{{Zone: "junesta.net.", DS: dsRecords, Override: false}},
+	}
+	resp := runRecursiveValidate(t, req.QName, req.QType)
+	// Re-run with zone trust anchors set.
+	resp = execRecursive(req)
+	if resp.DNSSECValid != true {
+		t.Errorf("DSAdd: DNSSECValid = %v, want true (redundant caller DS should not break validation)", resp.DNSSECValid)
+	}
+}
+
+// TestIntegration_DSReplace_Bogus verifies that supplying a wrong DS in replace
+// mode (override=true) causes validation to return BOGUS — the DNSKEY cannot
+// match a bad DS hash.
+func TestIntegration_DSReplace_Bogus(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping network integration tests (-short)")
+	}
+
+	badDS := TrustAnchorDS{
+		KeyTag:     9999,
+		Algorithm:  13,
+		DigestType: 2,
+		Digest:     strings.Repeat("FF", 32), // 64 hex chars — valid length but wrong digest
+	}
+	req := &QueryRequest{
+		QName:            "junesta.net.",
+		QType:            "SOA",
+		Mode:             "recursive",
+		Flags:            QueryFlags{DO: true, Validate: true},
+		TrustAnchorMode:  "iana",
+		ZoneTrustAnchors: []ZoneTrustAnchor{{Zone: "junesta.net.", DS: []TrustAnchorDS{badDS}, Override: true}},
+	}
+	resp := execRecursive(req)
+	if resp.DNSSECValid != false {
+		t.Errorf("DSReplace_Bogus: DNSSECValid = %v, want false (wrong caller DS should yield BOGUS)", resp.DNSSECValid)
+	}
+}
