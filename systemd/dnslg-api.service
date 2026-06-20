@@ -1,0 +1,26 @@
+[Unit]
+Description=DNS Looking Glass API daemon
+Documentation=https://github.com/karldyson/dns-looking-glass
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=dnslg
+Group=dnslg
+EnvironmentFile=/etc/default/dnslg-api
+ExecStart=/usr/local/bin/dnslg-api $DNSLG_ARGS
+Restart=on-failure
+RestartSec=5s
+
+# Harden the service
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

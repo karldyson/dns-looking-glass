@@ -1,0 +1,10 @@
+# Prevent direct HTTP access to the config file.
+# PHP code reads it from the filesystem; browsers must not fetch it directly.
+<Files "dnslg-config.json">
+    Require all denied
+</Files>
+
+# Also deny access to any backup or example config that may end up here.
+<FilesMatch "\.(example|bak|orig|swp)$">
+    Require all denied
+</FilesMatch>

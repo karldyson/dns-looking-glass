@@ -1,0 +1,79 @@
+{
+  "_comment": "DNS Looking Glass configuration file. Copy this to dnslg-config.json (in the webserver/ directory) and edit. The live config file is gitignored and will never be committed.",
+
+  "api": {
+    "_comment": "Default TCP port used to reach all remote Go API nodes. Can be overridden per node.",
+    "port": 53080
+  },
+
+  "nameservers": [
+    {
+      "_comment": "Each group has a display name, an optional list of CIDR prefixes that restrict visibility to matching client IPs, and a map of node items keyed by a short tag string.",
+      "name": "Global Nodes",
+      "prefixes": [
+        "_comment: Remove this _comment key and the entries below to make this group visible to all clients.",
+        "0.0.0.0/0",
+        "::/0"
+      ],
+      "items": {
+        "node-lon": {
+          "name": "London",
+          "host": "lon.example.com"
+        },
+        "node-fra": {
+          "name": "Frankfurt",
+          "host": "fra.example.com",
+          "_comment": "Override the global API port for this specific node.",
+          "port": 53081
+        },
+        "node-nyc": {
+          "name": "New York",
+          "host": "10.0.1.5"
+        },
+        "node-sin": {
+          "name": "Singapore",
+          "host": "sin.example.com"
+        }
+      }
+    },
+    {
+      "_comment": "A restricted group — only visible to clients whose IPs fall within the listed CIDR prefixes. Omit 'prefixes' entirely to make a group visible to all.",
+      "name": "Internal Nodes",
+      "prefixes": [
+        "10.0.0.0/8",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+        "fc00::/7"
+      ],
+      "items": {
+        "node-internal": {
+          "name": "Internal Resolver",
+          "host": "resolver.internal.example.com"
+        }
+      }
+    }
+  ],
+
+  "defaults": {
+    "_comment": "Tag of the node pre-selected on page load. Must match a key in one of the items maps.",
+    "nameserver": "node-lon",
+    "_comment2": "Default QTYPE selected in the dropdown.",
+    "qtype": "A"
+  },
+
+  "custom": {
+    "_comment": "Set enabled to true to show a free-text nameserver input field in the UI (Specify IP mode target). When false, users can still use Specify IP mode but cannot enter arbitrary targets — reserved for future per-group control.",
+    "enabled": false
+  },
+
+  "qtypes": [
+    "SOA", "NS", "A", "AAAA",
+    "DNSKEY", "CDNSKEY", "DS", "CDS",
+    "PTR", "TXT",
+    "RRSIG", "NSEC", "NSEC3",
+    "CNAME", "NAPTR", "MX", "SRV",
+    "CAA", "HTTPS", "SVCB",
+    "TLSA",
+    "ANY"
+  ]
+}

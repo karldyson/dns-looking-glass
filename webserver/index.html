@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DNS Looking Glass</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="header-inner">
+      <h1>DNS Looking Glass</h1>
+      <span class="header-subtitle">Multi-vantage DNS query tool</span>
+    </div>
+  </header>
+
+  <main class="main-content">
+    <form id="query-form" novalidate>
+
+      <!-- Query -->
+      <section class="form-section">
+        <h2 class="section-title">Query</h2>
+        <div class="query-row">
+          <div class="field-group field-qname">
+            <label for="qname">QNAME</label>
+            <input type="text" id="qname" name="qname" autocomplete="off" autocapitalize="off"
+                   spellcheck="false" placeholder="example.com" required>
+          </div>
+          <div class="field-group field-qtype">
+            <label for="qtype">QTYPE</label>
+            <select id="qtype" name="qtype"></select>
+          </div>
+        </div>
+      </section>
+
+      <!-- Query Mode -->
+      <section class="form-section">
+        <h2 class="section-title">Query Mode</h2>
+        <div class="mode-grid">
+          <label class="radio-label">
+            <input type="radio" name="mode" value="localhost" checked>
+            <span class="radio-text">
+              <strong>Localhost</strong>
+              <small>Query DNS software running on the remote node (127.0.0.1:53)</small>
+            </span>
+          </label>
+          <label class="radio-label">
+            <input type="radio" name="mode" value="target">
+            <span class="radio-text">
+              <strong>Specify IP</strong>
+              <small>Send query to a specific nameserver from the remote node</small>
+            </span>
+          </label>
+          <div id="target-fields" class="target-fields hidden">
+            <div class="target-inner">
+              <div class="field-group field-ns">
+                <label for="nameserver">Nameserver IP / hostname</label>
+                <input type="text" id="nameserver" name="nameserver"
+                       autocomplete="off" autocapitalize="off" spellcheck="false"
+                       placeholder="8.8.8.8">
+              </div>
+              <div class="field-group field-port">
+                <label for="dns-port">Port</label>
+                <input type="number" id="dns-port" name="port" value="53" min="1" max="65535">
+              </div>
+              <div class="field-group field-proto">
+                <label>Protocol</label>
+                <div class="toggle-group">
+                  <label class="toggle-label">
+                    <input type="radio" name="use_tcp" value="udp" checked> UDP
+                  </label>
+                  <label class="toggle-label">
+                    <input type="radio" name="use_tcp" value="tcp"> TCP
+                  </label>
+                </div>
+              </div>
+            </div>
+          </div>
+          <label class="radio-label">
+            <input type="radio" name="mode" value="recursive">
+            <span class="radio-text">
+              <strong>Full Recursive</strong>
+              <small>Go client resolves iteratively from root servers; with DO set, validates DNSSEC chain</small>
+            </span>
+          </label>
+        </div>
+      </section>
+
+      <!-- Header Flags -->
+      <section class="form-section">
+        <h2 class="section-title">Header Flags</h2>
+        <div class="flags-grid">
+          <label class="check-label" title="Recursion Desired — ask the server to recurse on your behalf">
+            <input type="checkbox" id="flag-rd" name="flag_rd" checked>
+            <span><abbr title="Recursion Desired">RD</abbr> Recursion Desired</span>
+          </label>
+          <label class="check-label" title="Checking Disabled — ask the server not to perform DNSSEC checking">
+            <input type="checkbox" id="flag-cd" name="flag_cd">
+            <span><abbr title="Checking Disabled">CD</abbr> Checking Disabled</span>
+          </label>
+          <label class="check-label" title="Authentic Data — request DNSSEC authenticated data">
+            <input type="checkbox" id="flag-ad" name="flag_ad" checked>
+            <span><abbr title="Authentic Data">AD</abbr> Authentic Data</span>
+          </label>
+          <label class="check-label" title="DNSSEC OK — request DNSSEC records in the response (requires EDNS)">
+            <input type="checkbox" id="flag-do" name="flag_do">
+            <span><abbr title="DNSSEC OK">DO</abbr> DNSSEC OK <small>(EDNS)</small></span>
+          </label>
+          <label class="check-label disabled" id="label-validate"
+                 aria-disabled="true"
+                 title="Validate DNSSEC chain — fetch DNSKEYs and verify signatures (recursive mode + DO only)">
+            <input type="checkbox" id="flag-validate" name="flag_validate" disabled>
+            <span>Validate DNSSEC chain <small>(recursive + DO)</small></span>
+          </label>
+          <div id="anchor-mode-fields" class="anchor-mode-fields hidden">
+            <span class="anchor-mode-label">Trust anchor source:</span>
+            <label class="radio-label-inline">
+              <input type="radio" name="anchor_mode" value="iana" checked>
+              <span>IANA anchors <small>(fetched by web server)</small></span>
+            </label>
+            <label class="radio-label-inline">
+              <input type="radio" name="anchor_mode" value="local">
+              <span>Local resolver AD bit <small>(on remote node)</small></span>
+            </label>
+          </div>
+        </div>
+      </section>
+
+      <!-- EDNS Options -->
+      <section class="form-section">
+        <h2 class="section-title">EDNS Options</h2>
+        <div class="edns-grid">
+
+          <label class="check-label">
+            <input type="checkbox" id="edns-size-enable" name="edns_size_enable">
+            <span>Override UDP payload size</span>
+          </label>
+          <div id="edns-size-fields" class="edns-sub hidden">
+            <div class="field-group field-udpsize">
+              <label for="edns-udp-size">UDP size <small>(512–4096)</small></label>
+              <input type="number" id="edns-udp-size" name="edns_udp_size"
+                     value="1232" min="512" max="4096">
+            </div>
+          </div>
+
+          <label class="check-label">
+            <input type="checkbox" id="edns-nsid" name="edns_nsid">
+            <span><abbr title="RFC 5001">NSID</abbr> — request Name Server Identifier</span>
+          </label>
+
+          <label class="check-label">
+            <input type="checkbox" id="edns-ecs-enable" name="edns_ecs_enable">
+            <span><abbr title="RFC 7871">EDNS Client Subnet</abbr></span>
+          </label>
+          <div id="edns-ecs-fields" class="edns-sub hidden">
+            <div class="ecs-inner">
+              <div class="field-group">
+                <label for="ecs-family">Family</label>
+                <select id="ecs-family" name="ecs_family">
+                  <option value="1">IPv4</option>
+                  <option value="2">IPv6</option>
+                </select>
+              </div>
+              <div class="field-group field-ecs-addr">
+                <label for="ecs-address">Address</label>
+                <input type="text" id="ecs-address" name="ecs_address"
+                       autocomplete="off" spellcheck="false" placeholder="0.0.0.0">
+              </div>
+              <div class="field-group field-ecs-src">
+                <label for="ecs-source">Source prefix</label>
+                <input type="number" id="ecs-source" name="ecs_source" value="24" min="0" max="128">
+              </div>
+              <div class="field-group field-ecs-scope">
+                <label for="ecs-scope">Scope prefix</label>
+                <input type="number" id="ecs-scope" name="ecs_scope" value="0" min="0" max="128">
+              </div>
+            </div>
+          </div>
+
+        </div>
+      </section>
+
+      <!-- Nodes -->
+      <section class="form-section">
+        <h2 class="section-title">Nodes</h2>
+        <div id="nodes-container" class="nodes-container">
+          <p class="loading-hint">Loading nodes…</p>
+        </div>
+      </section>
+
+      <div class="submit-row">
+        <button type="submit" id="submit-btn" class="btn-primary">Send Query</button>
+        <span id="query-status" class="query-status" aria-live="polite"></span>
+      </div>
+
+    </form>
+
+    <!-- Results -->
+    <section id="results" class="results hidden" aria-label="Query results">
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <p>DNS Looking Glass &copy; <a href="https://karl.dyson.uk.net/">Karl Dyson</a> 2024–2026.
+       Licensed under the <a href="LICENSE">Apache License 2.0</a>.</p>
+  </footer>
+
+  <script src="dns-parser.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

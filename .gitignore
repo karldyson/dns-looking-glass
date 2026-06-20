@@ -1,0 +1,21 @@
+# Live config — never commit; copy from dnslg-config.example.json
+webserver/dnslg-config.json
+dnslg-config.json
+
+# systemd environment file — never commit; copy from systemd/dnslg-api.default.example
+systemd/dnslg-api.default
+dnslg-api.default
+
+# Go build output
+remote-node/build/
+
+# macOS
+.DS_Store
+
+# Editor
+.idea/
+.vscode/
+*.swp
+*~
+
+.claude/

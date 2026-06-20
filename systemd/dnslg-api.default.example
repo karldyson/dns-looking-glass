@@ -1,0 +1,26 @@
+# Environment file for dnslg-api
+# Copy this file to /etc/default/dnslg-api and edit as required.
+# This file is sourced by systemd as an EnvironmentFile.
+# The DNSLG_ARGS variable is passed directly to the dnslg-api binary.
+#
+# Available flags:
+#   -port <int>     TCP port to listen on (default: 53080)
+#   -bind <string>  Comma-separated bind addresses (default: 127.0.0.1)
+#                   Use "0.0.0.0" for all IPv4 interfaces.
+#                   Use "0.0.0.0,::" for explicit dual-stack (IPv4 + IPv6).
+#                   Use "::" for IPv6 only (behaviour may be OS-dependent).
+#
+# Examples:
+#   Localhost only (default, most secure):
+#     DNSLG_ARGS=-port 53080 -bind 127.0.0.1
+#
+#   All IPv4 interfaces:
+#     DNSLG_ARGS=-port 53080 -bind 0.0.0.0
+#
+#   Dual-stack (IPv4 + IPv6):
+#     DNSLG_ARGS=-port 53080 -bind 0.0.0.0,::
+#
+#   Custom port, dual-stack:
+#     DNSLG_ARGS=-port 8053 -bind 0.0.0.0,::
+
+DNSLG_ARGS=-port 53080 -bind 127.0.0.1
