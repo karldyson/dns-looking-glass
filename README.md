@@ -35,10 +35,10 @@ Web server (Apache or nginx + PHP 7.4+)
 - **Three query modes:**
   - *Localhost* — query DNS software running on the remote node (default)
   - *Specify IP* — send a query to an arbitrary nameserver from the node's vantage point
-  - *Full Recursive* — iterative resolution from root servers; each delegation step is shown with the nameserver hostname and IP
+  - *Full Recursive* — iterative resolution from root servers; the resolver chases CNAME chains and NS referrals until a final answer is reached (up to 30 steps); each delegation step is shown with the nameserver hostname and IP; unresolvable NS names produce a diagnostic step rather than a silent stop
 - **DNSSEC support:**
   - Set DO to request DNSSEC records (RRSIG, DS) throughout the resolution chain
-  - Enable *Validate DNSSEC chain* to additionally verify DS→DNSKEY links, DNSKEY self-signatures, and the final answer RRSIG; reports Secure / Bogus / Insecure / Indeterminate per RFC 4034/4035/5155/6840
+  - Enable *Validate DNSSEC chain* to additionally verify DS→DNSKEY links, DNSKEY self-signatures, and the final answer RRSIG; always produces one of four definitive states: **Secure** (all checks pass), **Bogus** (a specific check failed), **Insecure** (unsigned delegation — no parent DS), or **Indeterminate** (a precondition was unmet, e.g. network error fetching DNSKEY, missing trust anchor, or no RRSIGs in the answer — the step notes say which)
   - Trust anchor source is selectable: IANA root anchors (fetched by the web server from `root-anchors.xml`) or the remote node's local validating resolver (AD bit check)
   - **DS override/add** — supply DS records for any zone in the chain to test signing changes before publishing them in the parent:
     - *Add mode*: your DS is accepted alongside the existing parent DS (pre-rollover check — tests that a new KSK won't break resolution)
