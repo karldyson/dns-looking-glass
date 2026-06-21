@@ -1586,6 +1586,7 @@ func TestIntegration_DSReplace_Bogus(t *testing.T) {
 		Mode:             "recursive",
 		Flags:            QueryFlags{DO: true, Validate: true},
 		TrustAnchorMode:  "iana",
+		TrustAnchors:     testIANATrustAnchors,
 		ZoneTrustAnchors: []ZoneTrustAnchor{{Zone: "junesta.net.", DS: []TrustAnchorDS{badDS}, Override: true}},
 	}
 	resp := execRecursive(req)

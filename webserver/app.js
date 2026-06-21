@@ -77,7 +77,26 @@ function populateNodes(groups) {
 
     const nameEl = document.createElement('div');
     nameEl.className = 'node-group-name';
-    nameEl.textContent = group.name;
+
+    const nameText = document.createElement('span');
+    nameText.textContent = group.name;
+    nameEl.appendChild(nameText);
+
+    const ctrlsEl = document.createElement('span');
+    ctrlsEl.className = 'node-group-controls';
+    const allBtn = document.createElement('button');
+    allBtn.type = 'button';
+    allBtn.className = 'node-select-link';
+    allBtn.textContent = 'all';
+    const noneBtn = document.createElement('button');
+    noneBtn.type = 'button';
+    noneBtn.className = 'node-select-link';
+    noneBtn.textContent = 'none';
+    ctrlsEl.appendChild(allBtn);
+    ctrlsEl.appendChild(document.createTextNode(' / '));
+    ctrlsEl.appendChild(noneBtn);
+    nameEl.appendChild(ctrlsEl);
+
     groupEl.appendChild(nameEl);
 
     const itemsEl = document.createElement('div');
@@ -105,6 +124,13 @@ function populateNodes(groups) {
       label.appendChild(cb);
       label.appendChild(span);
       itemsEl.appendChild(label);
+    });
+
+    allBtn.addEventListener('click', () => {
+      itemsEl.querySelectorAll('input[type=checkbox]').forEach(cb => { cb.checked = true; });
+    });
+    noneBtn.addEventListener('click', () => {
+      itemsEl.querySelectorAll('input[type=checkbox]').forEach(cb => { cb.checked = false; });
     });
 
     groupEl.appendChild(itemsEl);
@@ -309,9 +335,9 @@ async function onSubmit(e) {
     const name = nodeLabel(selectedNodes[i].dataset.nodeName, payload);
     return p.then(result => {
       if (multi) {
-        fillPanel(panels[tag], name, result, true);
+        fillPanel(panels[tag], name, result, true, payload.mode);
       } else {
-        const panel = buildResultPanel(name, result, false);
+        const panel = buildResultPanel(name, result, false, payload.mode);
         resultsEl.appendChild(panel);
       }
     });
@@ -433,12 +459,12 @@ function createSkeletonPanel(tag, name) {
   return panel;
 }
 
-function fillPanel(panel, name, data, accordion) {
+function fillPanel(panel, name, data, accordion, mode) {
   const header = panel.querySelector('.result-panel-header');
   const body = panel.querySelector('.result-panel-body');
   header.querySelector('.result-timing').innerHTML = timingHTML(data);
   body.innerHTML = '';
-  appendResultContent(body, data);
+  appendResultContent(body, data, mode);
   if (!panel.querySelector('.accordion-toggle')) {
     const tog = document.createElement('span');
     tog.className = 'accordion-toggle';
@@ -447,7 +473,7 @@ function fillPanel(panel, name, data, accordion) {
   }
 }
 
-function buildResultPanel(name, data, accordion) {
+function buildResultPanel(name, data, accordion, mode) {
   const panel = document.createElement('div');
   panel.className = 'result-panel';
   const showToggle = accordion;
@@ -460,7 +486,7 @@ function buildResultPanel(name, data, accordion) {
     </div>
     <div class="result-panel-body"></div>`;
 
-  appendResultContent(panel.querySelector('.result-panel-body'), data);
+  appendResultContent(panel.querySelector('.result-panel-body'), data, mode);
   if (accordion) wireAccordion(panel);
   return panel;
 }
@@ -475,7 +501,7 @@ function timingHTML(data) {
     + (dns ? ` &nbsp;(DNS: ${dns}ms / overhead: ${overhead}ms)` : '');
 }
 
-function appendResultContent(body, data) {
+function appendResultContent(body, data, mode) {
   if (data.error) {
     const errEl = document.createElement('div');
     errEl.className = 'result-error';
@@ -517,24 +543,36 @@ function appendResultContent(body, data) {
     body.appendChild(buildChainSection(data.resolution_chain));
   }
 
-  // Packet visualiser (query + response).
+  // Packet visualiser (query + response). Collapsed by default in localhost/target mode.
   if (data.query_bytes_hex || data.response_bytes_hex) {
-    body.appendChild(buildPacketSection(data));
+    body.appendChild(buildPacketSection(data, mode !== 'recursive'));
   }
 }
 
 function buildChainSection(chain) {
+  const resSteps = chain.filter(s => !s.validation_step);
+  const valSteps = chain.filter(s => s.validation_step);
+
   const sec = document.createElement('div');
   sec.className = 'chain-section';
-  const title = document.createElement('div');
-  title.className = 'chain-title';
-  title.textContent = `Resolution chain (${chain.length} step${chain.length !== 1 ? 's' : ''})`;
-  sec.appendChild(title);
 
-  chain.forEach((step, i) => {
+  appendStepGroup(sec, `Resolution chain (${resSteps.length} step${resSteps.length !== 1 ? 's' : ''})`, resSteps, 'chain-title');
+  if (valSteps.length > 0) {
+    appendStepGroup(sec, `DNSSEC validation (${valSteps.length} step${valSteps.length !== 1 ? 's' : ''})`, valSteps, 'chain-title chain-title-validation');
+  }
+  return sec;
+}
+
+function appendStepGroup(container, title, steps, titleClass) {
+  const titleEl = document.createElement('div');
+  titleEl.className = titleClass;
+  titleEl.textContent = title;
+  container.appendChild(titleEl);
+
+  steps.forEach((step, i) => {
     const stepEl = document.createElement('div');
     stepEl.className = 'chain-step';
-    if (i === chain.length - 1) stepEl.classList.add('open');
+    if (i === steps.length - 1) stepEl.classList.add('open');
 
     const hdr = document.createElement('div');
     hdr.className = 'chain-step-header';
@@ -550,6 +588,13 @@ function buildChainSection(chain) {
 
     const bodyEl = document.createElement('div');
     bodyEl.className = 'chain-step-body';
+    if (step.nsid) {
+      const nsidEl = document.createElement('div');
+      nsidEl.className = 'response-text-block';
+      nsidEl.style.fontSize = '0.75rem';
+      nsidEl.textContent = `NSID: ${step.nsid}`;
+      bodyEl.appendChild(nsidEl);
+    }
     if (step.response_text) {
       const pre = document.createElement('div');
       pre.className = 'response-text-block';
@@ -562,10 +607,8 @@ function buildChainSection(chain) {
 
     stepEl.appendChild(hdr);
     stepEl.appendChild(bodyEl);
-    sec.appendChild(stepEl);
+    container.appendChild(stepEl);
   });
-
-  return sec;
 }
 
 // ── Accordion ─────────────────────────────────────────────────────────────────
@@ -611,14 +654,28 @@ function restoreFromURL() {
 }
 
 // ── Packet visualiser ─────────────────────────────────────────────────────────
-function buildPacketSection(data) {
+function buildPacketSection(data, collapsed = false) {
   const sec = document.createElement('div');
   sec.className = 'packet-section';
 
   const title = document.createElement('div');
-  title.className = 'packet-title';
-  title.textContent = 'Packet View';
+  title.className = 'packet-title packet-title-toggle';
+  const arrow = document.createElement('span');
+  arrow.className = 'packet-collapse-arrow';
+  arrow.textContent = collapsed ? '▸' : '▾';
+  title.appendChild(arrow);
+  title.appendChild(document.createTextNode(' Packet View'));
   sec.appendChild(title);
+
+  const inner = document.createElement('div');
+  inner.className = 'packet-inner';
+  if (collapsed) inner.classList.add('hidden');
+  sec.appendChild(inner);
+
+  title.addEventListener('click', () => {
+    const nowCollapsed = inner.classList.toggle('hidden');
+    arrow.textContent = nowCollapsed ? '▸' : '▾';
+  });
 
   // Sub-tabs: Query / Response.
   const subBar = document.createElement('div');
@@ -639,7 +696,7 @@ function buildPacketSection(data) {
     panes.response = { hex: data.response_bytes_hex, btn };
   }
 
-  if (hasBoth) sec.appendChild(subBar);
+  if (hasBoth) inner.appendChild(subBar);
 
   // Wireshark / Hex dump tabs.
   const tabsBar = document.createElement('div');
@@ -648,11 +705,11 @@ function buildPacketSection(data) {
   const hexBtn = makeTabBtn('Hex Dump', false);
   tabsBar.appendChild(wsBtn);
   tabsBar.appendChild(hexBtn);
-  sec.appendChild(tabsBar);
+  inner.appendChild(tabsBar);
 
   // Content area.
   const content = document.createElement('div');
-  sec.appendChild(content);
+  inner.appendChild(content);
 
   function render(hexStr) {
     content.innerHTML = '';
