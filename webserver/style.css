@@ -363,8 +363,8 @@ input[type="text"].error { border-color: var(--color-error); }
 
 /* Resolution chain (recursive mode) */
 .chain-section { display: flex; flex-direction: column; gap: 0.5rem; }
-.chain-title { font-size: 0.8125rem; font-weight: 600; color: var(--color-text-muted); text-transform: uppercase; letter-spacing: 0.05em; }
-.chain-title-validation { margin-top: 1.25rem; padding-top: 1rem; border-top: 1px solid var(--color-border-light); }
+.chain-title { font-size: 0.8125rem; font-weight: 600; color: var(--color-text-muted); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.75rem; }
+.chain-title-validation { margin-top: 1.25rem; padding-top: 1.25rem; border-top: 1px solid var(--color-border-light); }
 .chain-step {
   border: 1px solid var(--color-border-light);
   border-radius: var(--radius-sm);
@@ -382,8 +382,8 @@ input[type="text"].error { border-color: var(--color-error); }
   user-select: none;
 }
 .chain-step-header:hover { background: #eff1f5; }
-.chain-step-body { display: none; padding: 0.75rem; }
-.chain-step.open .chain-step-body { display: block; }
+.chain-step-body { display: none; padding: 0.75rem; flex-direction: column; gap: 0.75rem; }
+.chain-step.open .chain-step-body { display: flex; }
 .chain-step-note {
   margin-left: 0.6em;
   font-size: 0.82em;
@@ -496,7 +496,7 @@ input[type="text"].error { border-color: var(--color-error); }
 .ds-remove:hover { background: var(--color-danger-bg, #fee2e2); color: var(--color-danger, #dc2626); border-color: var(--color-danger, #dc2626); }
 
 /* ── Packet visualiser ───────────────────────────────────────────────────── */
-.packet-section { display: flex; flex-direction: column; gap: 0.625rem; }
+.packet-section { display: flex; flex-direction: column; gap: 0.75rem; }
 .packet-title { font-size: 0.8125rem; font-weight: 600; color: var(--color-text-muted); text-transform: uppercase; letter-spacing: 0.05em; }
 .packet-title-toggle { cursor: pointer; user-select: none; display: flex; align-items: center; gap: 0.3em; }
 .packet-title-toggle:hover { color: var(--color-text); }
