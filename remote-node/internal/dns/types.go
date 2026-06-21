@@ -74,7 +74,9 @@ type ResolutionStep struct {
 	NameserverName   string  `json:"nameserver_name,omitempty"` // hostname, if known
 	QName            string  `json:"qname"`
 	QType            string  `json:"qtype"`
-	StepNote         string  `json:"step_note,omitempty"` // human-readable annotation for validation steps
+	StepNote         string  `json:"step_note,omitempty"`         // human-readable annotation for validation steps
+	ValidationStep   bool    `json:"validation_step,omitempty"`   // true for DNSSEC validation steps (not resolution)
+	NSID             string  `json:"nsid,omitempty"`
 	ResponseText     string  `json:"response_text"`
 	QueryBytesHex    string  `json:"query_bytes_hex"`
 	ResponseBytesHex string  `json:"response_bytes_hex"`

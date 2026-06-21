@@ -8,6 +8,8 @@ import (
 	"strings"
 	"time"
 
+	"dns-looking-glass/internal/dns/edns"
+
 	"github.com/miekg/dns"
 )
 
@@ -54,6 +56,15 @@ func execRecursive(req *QueryRequest) *QueryResponse {
 	var chain []ResolutionStep
 	var dnssecValid interface{} = nil
 
+	// Detect user-requested NSID once so we can include it in every iterative query.
+	nsidRequested := false
+	for _, opt := range req.EDNS.Options {
+		if code, ok := opt["code"].(float64); ok && uint16(code) == dns.EDNS0NSID {
+			nsidRequested = true
+			break
+		}
+	}
+
 	// Start with a random root server for load distribution.
 	nameservers := shuffledNamed(rootServerList)
 
@@ -74,10 +85,15 @@ func execRecursive(req *QueryRequest) *QueryResponse {
 		msg.AuthenticatedData = req.Flags.AD
 		msg.CheckingDisabled = req.Flags.CD
 
-		if req.Flags.DO {
+		if req.Flags.DO || nsidRequested {
 			o := &dns.OPT{Hdr: dns.RR_Header{Name: ".", Rrtype: dns.TypeOPT}}
 			o.SetUDPSize(1232)
-			o.SetDo()
+			if req.Flags.DO {
+				o.SetDo()
+			}
+			if nsidRequested {
+				o.Option = append(o.Option, &dns.EDNS0_NSID{Code: dns.EDNS0NSID})
+			}
 			msg.Extra = append(msg.Extra, o)
 		}
 
@@ -114,6 +130,9 @@ func execRecursive(req *QueryRequest) *QueryResponse {
 		stepEntry.QueryBytesHex = hex.EncodeToString(queryBytes)
 		stepEntry.ResponseBytesHex = hex.EncodeToString(responseBytes)
 		stepEntry.DNSQueryMS = elapsed
+		if nsidRequested {
+			stepEntry.NSID = extractNSIDFromMsg(resp)
+		}
 		chain = append(chain, stepEntry)
 
 		dbg("step %d: rcode=%s aa=%v answer=%d ns=%d additional=%d (%.1fms)",
@@ -138,6 +157,9 @@ func execRecursive(req *QueryRequest) *QueryResponse {
 				if req.Flags.DO && req.Flags.Validate {
 					var validationSteps []ResolutionStep
 					dnssecValid, validationSteps = validateChainOfTrust(chain, req)
+					for i := range validationSteps {
+						validationSteps[i].ValidationStep = true
+					}
 					chain = append(chain, validationSteps...)
 				}
 				return buildRecursiveResponse(chain, dnssecValid)
@@ -191,6 +213,9 @@ func execRecursive(req *QueryRequest) *QueryResponse {
 			if req.Flags.DO && req.Flags.Validate {
 				var validationSteps []ResolutionStep
 				dnssecValid, validationSteps = validateChainOfTrust(chain, req)
+				for i := range validationSteps {
+					validationSteps[i].ValidationStep = true
+				}
 				chain = append(chain, validationSteps...)
 			}
 			return buildRecursiveResponse(chain, dnssecValid)
@@ -200,6 +225,9 @@ func execRecursive(req *QueryRequest) *QueryResponse {
 			if req.Flags.DO && req.Flags.Validate {
 				var validationSteps []ResolutionStep
 				dnssecValid, validationSteps = validateChainOfTrust(chain, req)
+				for i := range validationSteps {
+					validationSteps[i].ValidationStep = true
+				}
 				chain = append(chain, validationSteps...)
 			}
 			return buildRecursiveResponse(chain, dnssecValid)
@@ -215,12 +243,17 @@ func execRecursive(req *QueryRequest) *QueryResponse {
 }
 
 func buildRecursiveResponse(chain []ResolutionStep, dnssecValid interface{}) *QueryResponse {
-	var lastResponse, lastNS string
+	var lastResponse, lastNS, lastNSID string
 	var totalMS float64
-	if len(chain) > 0 {
-		last := chain[len(chain)-1]
-		lastResponse = last.ResponseText
-		lastNS = last.Nameserver
+	// Use the last resolution step (not a validation step) for the top-level response,
+	// so the "answer" box always shows the DNS answer regardless of whether validation ran.
+	for i := len(chain) - 1; i >= 0; i-- {
+		if !chain[i].ValidationStep {
+			lastResponse = chain[i].ResponseText
+			lastNS = chain[i].Nameserver
+			lastNSID = chain[i].NSID
+			break
+		}
 	}
 	for _, step := range chain {
 		totalMS += step.DNSQueryMS
@@ -228,6 +261,7 @@ func buildRecursiveResponse(chain []ResolutionStep, dnssecValid interface{}) *Qu
 	return &QueryResponse{
 		Nameserver:      lastNS,
 		ResponseText:    lastResponse,
+		NSID:            lastNSID,
 		DNSQueryMS:      totalMS,
 		DNSSECValid:     dnssecValid,
 		ResolutionChain: chain,
@@ -344,6 +378,14 @@ func validateChainOfTrust(chain []ResolutionStep, req *QueryRequest) (interface{
 		return "indeterminate", nil
 	}
 
+	nsidRequested := false
+	for _, opt := range req.EDNS.Options {
+		if code, ok := opt["code"].(float64); ok && uint16(code) == dns.EDNS0NSID {
+			nsidRequested = true
+			break
+		}
+	}
+
 	levels, lastChainIdx := parseDelegationChain(chain)
 	if len(levels) == 0 {
 		dbg("validate: no delegation levels parsed")
@@ -401,7 +443,7 @@ func validateChainOfTrust(chain []ResolutionStep, req *QueryRequest) (interface{
 			return "insecure", extraSteps
 		}
 
-		keyResp, step := fetchDNSKEYResponse(level.zone, level.ns)
+		keyResp, step := fetchDNSKEYResponse(level.zone, level.ns, nsidRequested)
 		step.StepNote = fmt.Sprintf("Validating %s DNSKEY", level.zone)
 
 		if keyResp == nil {
@@ -532,7 +574,7 @@ func validateChainOfTrust(chain []ResolutionStep, req *QueryRequest) (interface{
 					// chain (e.g. uk. and co.uk. share nameservers so the uk. server returns
 					// the junesta.co.uk. DS signed by co.uk.'s ZSK directly).
 					dbg("validate: DS signer %q ≠ current zone %q — interpolating intermediate zone(s)", signer, level.zone)
-					intKeys, intSteps, intOK := validateIntermediateZones(level.zone, signer, level.ns, keys)
+					intKeys, intSteps, intOK := validateIntermediateZones(level.zone, signer, level.ns, keys, nsidRequested)
 					extraSteps = append(extraSteps, intSteps...)
 					if !intOK {
 						step.StepNote += fmt.Sprintf(", intermediate zone %s validation failed (BOGUS)", signer)
@@ -627,7 +669,7 @@ func validateChainOfTrust(chain []ResolutionStep, req *QueryRequest) (interface{
 
 	if signerZone != last.zone {
 		dbg("validate: signer zone differs — fetching DS for %s from parent server %s", signerZone, last.ns.addr)
-		dsResp, dsStep := fetchDSResponse(signerZone, last.ns)
+		dsResp, dsStep := fetchDSResponse(signerZone, last.ns, nsidRequested)
 		dsStep.StepNote = fmt.Sprintf("Fetching DS for %s (zone boundary not seen in referrals)", signerZone)
 		extraSteps = append(extraSteps, dsStep)
 		dsStepIdx := len(extraSteps) - 1
@@ -760,7 +802,7 @@ func validateChainOfTrust(chain []ResolutionStep, req *QueryRequest) (interface{
 				}
 				dbg("validate: NOERROR but no DS for %s → insecure", signerZone)
 				extraSteps[len(extraSteps)-1].StepNote += " — no DS records in parent, unsigned delegation (insecure)"
-				selfSteps, _ := attemptSelfVerification(signerZone, last)
+				selfSteps, _ := attemptSelfVerification(signerZone, last, nsidRequested)
 				return "insecure", append(extraSteps, selfSteps...)
 			} else {
 				return "indeterminate", extraSteps
@@ -786,7 +828,7 @@ func validateChainOfTrust(chain []ResolutionStep, req *QueryRequest) (interface{
 				dsSigner := strings.ToLower(dns.Fqdn(sig.SignerName))
 				if dsSigner != last.zone {
 					dbg("validate: DS signer %q ≠ last zone %q — interpolating intermediate zone(s)", dsSigner, last.zone)
-					intKeys, intSteps, intOK := validateIntermediateZones(last.zone, dsSigner, last.ns, keys)
+					intKeys, intSteps, intOK := validateIntermediateZones(last.zone, dsSigner, last.ns, keys, nsidRequested)
 					extraSteps = append(extraSteps, intSteps...)
 					if !intOK {
 						extraSteps[dsStepIdx].StepNote += fmt.Sprintf(" — intermediate zone %s validation failed (BOGUS)", dsSigner)
@@ -808,7 +850,7 @@ func validateChainOfTrust(chain []ResolutionStep, req *QueryRequest) (interface{
 			extraSteps[dsStepIdx].StepNote += " — DS sig OK"
 		}
 
-		childKeyResp, childKeyStep := fetchDNSKEYResponse(signerZone, last.ns)
+		childKeyResp, childKeyStep := fetchDNSKEYResponse(signerZone, last.ns, nsidRequested)
 		childKeyStep.StepNote = fmt.Sprintf("Validating %s DNSKEY", signerZone)
 		if childKeyResp == nil {
 			dbg("validate: DNSKEY fetch failed for child zone %s", signerZone)
@@ -1112,8 +1154,8 @@ func convertZoneDS(zone string, anchors []TrustAnchorDS) []*dns.DS {
 // last.resp against those keys, without requiring a DS in the parent. Used to
 // show whether a zone is self-consistently signed before DS is published.
 // Returns extra steps and a human-readable note.
-func attemptSelfVerification(zone string, last zoneLevel) ([]ResolutionStep, string) {
-	keyResp, keyStep := fetchDNSKEYResponse(zone, last.ns)
+func attemptSelfVerification(zone string, last zoneLevel, nsidRequested bool) ([]ResolutionStep, string) {
+	keyResp, keyStep := fetchDNSKEYResponse(zone, last.ns, nsidRequested)
 	keyStep.StepNote = fmt.Sprintf("Self-verification: fetching %s DNSKEY (no parent DS — not a chain-of-trust check)", zone)
 	if keyResp == nil {
 		keyStep.StepNote += " — fetch failed"
@@ -1376,7 +1418,7 @@ func dsRRSigSigner(resp *dns.Msg) string {
 // (exclusive) and signerZone (inclusive) by querying ns, which serves all of them
 // (the shared-nameserver case, e.g. uk. and co.uk. on the same servers).
 // It returns the validated DNSKEY set for signerZone, any extra steps, and success.
-func validateIntermediateZones(parentZone, signerZone string, ns namedAddr, parentKeys []*dns.DNSKEY) ([]*dns.DNSKEY, []ResolutionStep, bool) {
+func validateIntermediateZones(parentZone, signerZone string, ns namedAddr, parentKeys []*dns.DNSKEY, nsidRequested bool) ([]*dns.DNSKEY, []ResolutionStep, bool) {
 	// Build the ordered list of zones to traverse from just below parentZone to signerZone.
 	var zones []string
 	for z := signerZone; z != parentZone; {
@@ -1392,7 +1434,7 @@ func validateIntermediateZones(parentZone, signerZone string, ns namedAddr, pare
 	currentKeys := parentKeys
 
 	for _, zone := range zones {
-		dsResp, dsStep := fetchDSResponse(zone, ns)
+		dsResp, dsStep := fetchDSResponse(zone, ns, nsidRequested)
 		dsStep.StepNote = fmt.Sprintf("Fetching DS for intermediate zone %s (zone boundary inferred from RRSIG signer)", zone)
 		extraSteps = append(extraSteps, dsStep)
 
@@ -1417,7 +1459,7 @@ func validateIntermediateZones(parentZone, signerZone string, ns namedAddr, pare
 		}
 		dsStep.StepNote += " — DS sig OK"
 
-		keyResp, keyStep := fetchDNSKEYResponse(zone, ns)
+		keyResp, keyStep := fetchDNSKEYResponse(zone, ns, nsidRequested)
 		keyStep.StepNote = fmt.Sprintf("Validating intermediate zone %s DNSKEY", zone)
 		extraSteps = append(extraSteps, keyStep)
 
@@ -1472,13 +1514,16 @@ func exchangeWithTCPFallback(msg *dns.Msg, addr string) (*dns.Msg, string, error
 // fetchDSResponse queries ns for the DS RRset at zone (used when an authoritative
 // server answers child-zone queries directly without a referral, so we never saw
 // the DS records in a referral authority section).
-func fetchDSResponse(zone string, ns namedAddr) (*dns.Msg, ResolutionStep) {
+func fetchDSResponse(zone string, ns namedAddr, nsidRequested bool) (*dns.Msg, ResolutionStep) {
 	m := new(dns.Msg)
 	m.SetQuestion(dns.Fqdn(zone), dns.TypeDS)
 	m.RecursionDesired = false
 	o := &dns.OPT{Hdr: dns.RR_Header{Name: ".", Rrtype: dns.TypeOPT}}
 	o.SetUDPSize(1232)
 	o.SetDo()
+	if nsidRequested {
+		o.Option = append(o.Option, &dns.EDNS0_NSID{Code: dns.EDNS0NSID})
+	}
 	m.Extra = append(m.Extra, o)
 
 	queryBytes, _ := m.Pack()
@@ -1505,6 +1550,9 @@ func fetchDSResponse(zone string, ns namedAddr) (*dns.Msg, ResolutionStep) {
 		step.ResponseText = "; " + tcNote + "\n" + step.ResponseText
 	}
 	step.ResponseBytesHex = hex.EncodeToString(responseBytes)
+	if nsidRequested {
+		step.NSID = extractNSIDFromMsg(resp)
+	}
 	return resp, step
 }
 
@@ -1542,13 +1590,16 @@ func verifyDSRRSigInAnswer(answer []dns.RR, parentKeys []*dns.DNSKEY) bool {
 
 // fetchDNSKEYResponse queries ns for the DNSKEY RRset at zone, returning the full
 // DNS response and a ResolutionStep for the chain.
-func fetchDNSKEYResponse(zone string, ns namedAddr) (*dns.Msg, ResolutionStep) {
+func fetchDNSKEYResponse(zone string, ns namedAddr, nsidRequested bool) (*dns.Msg, ResolutionStep) {
 	m := new(dns.Msg)
 	m.SetQuestion(dns.Fqdn(zone), dns.TypeDNSKEY)
 	m.RecursionDesired = false
 	o := &dns.OPT{Hdr: dns.RR_Header{Name: ".", Rrtype: dns.TypeOPT}}
 	o.SetUDPSize(1232)
 	o.SetDo()
+	if nsidRequested {
+		o.Option = append(o.Option, &dns.EDNS0_NSID{Code: dns.EDNS0NSID})
+	}
 	m.Extra = append(m.Extra, o)
 
 	queryBytes, _ := m.Pack()
@@ -1575,7 +1626,28 @@ func fetchDNSKEYResponse(zone string, ns namedAddr) (*dns.Msg, ResolutionStep) {
 		step.ResponseText = "; " + tcNote + "\n" + step.ResponseText
 	}
 	step.ResponseBytesHex = hex.EncodeToString(responseBytes)
+	if nsidRequested {
+		step.NSID = extractNSIDFromMsg(resp)
+	}
 	return resp, step
+}
+
+func extractNSIDFromMsg(resp *dns.Msg) string {
+	for _, extra := range resp.Extra {
+		if opt, ok := extra.(*dns.OPT); ok {
+			parsed := edns.ParseAll(opt)
+			if nsidData, ok := parsed[dns.EDNS0NSID]; ok {
+				if txt, ok := nsidData["nsid_txt"].(string); ok && txt != "" {
+					return txt
+				}
+				if h, ok := nsidData["nsid_hex"].(string); ok {
+					return h
+				}
+			}
+			break
+		}
+	}
+	return ""
 }
 
 func extractDNSKEYs(resp *dns.Msg) []*dns.DNSKEY {
