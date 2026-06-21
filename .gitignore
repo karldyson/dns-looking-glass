@@ -9,6 +9,9 @@ dnslg-api.default
 # Go build output
 remote-node/build/
 
+# Generated at build time by Makefile (version injection for the web UI)
+webserver/version.json
+
 # macOS
 .DS_Store
 

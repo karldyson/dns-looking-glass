@@ -12,6 +12,7 @@ document.addEventListener('DOMContentLoaded', () => {
     restoreFromURL();
     wireFormBehaviours();
   });
+  loadVersion();
 
   document.getElementById('query-form').addEventListener('submit', onSubmit);
 });
@@ -39,6 +40,18 @@ async function loadConfig() {
     document.getElementById('nodes-container').innerHTML =
       `<p class="loading-hint" style="color:var(--color-error)">Failed to load config: ${e.message}</p>`;
   }
+}
+
+async function loadVersion() {
+  try {
+    const resp = await fetch('version.json');
+    if (!resp.ok) return;
+    const data = await resp.json();
+    if (data.version) {
+      const el = document.getElementById('app-version');
+      if (el) el.textContent = ` — ${data.version}`;
+    }
+  } catch (_) { /* version.json absent; degrade silently */ }
 }
 
 function populateQTypes(qtypes) {

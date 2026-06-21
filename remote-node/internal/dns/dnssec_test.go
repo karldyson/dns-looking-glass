@@ -201,7 +201,7 @@ func TestAnyKeyMatchesDS(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := anyKeyMatchesDS(tc.keys, tc.ds); got != tc.want {
+			if got, _ := anyKeyMatchesDS(tc.keys, tc.ds); got != tc.want {
 				t.Errorf("anyKeyMatchesDS = %v, want %v", got, tc.want)
 			}
 		})
@@ -215,7 +215,7 @@ func TestVerifyDNSKEYRRSig_Valid(t *testing.T) {
 	rrset := []dns.RR{ksk}
 	sig := signRRset(t, ksk, signer, rrset)
 	msg := &dns.Msg{Answer: []dns.RR{ksk, sig}}
-	if err := verifyDNSKEYRRSig([]*dns.DNSKEY{ksk}, msg); err != nil {
+	if err, _ := verifyDNSKEYRRSig([]*dns.DNSKEY{ksk}, msg); err != nil {
 		t.Errorf("expected nil for valid self-signature, got %v", err)
 	}
 }
@@ -224,7 +224,7 @@ func TestVerifyDNSKEYRRSig_NoRRSIG(t *testing.T) {
 	ksk, _ := makeKSK(t, "example.com.")
 	msg := &dns.Msg{Answer: []dns.RR{ksk}}
 	// No RRSIGs — function returns nil (trust established via DS comparison).
-	if err := verifyDNSKEYRRSig([]*dns.DNSKEY{ksk}, msg); err != nil {
+	if err, _ := verifyDNSKEYRRSig([]*dns.DNSKEY{ksk}, msg); err != nil {
 		t.Errorf("expected nil when no RRSIGs present, got %v", err)
 	}
 }
@@ -235,7 +235,7 @@ func TestVerifyDNSKEYRRSig_WrongKey(t *testing.T) {
 	sig := signRRset(t, ksk1, signer1, []dns.RR{ksk1})
 	msg := &dns.Msg{Answer: []dns.RR{ksk1, sig}}
 	// Provide ksk2: different KeyTag → the tag check in the loop never matches.
-	if err := verifyDNSKEYRRSig([]*dns.DNSKEY{ksk2}, msg); err == nil {
+	if err, _ := verifyDNSKEYRRSig([]*dns.DNSKEY{ksk2}, msg); err == nil {
 		t.Error("expected non-nil error with wrong key")
 	}
 }
@@ -251,7 +251,7 @@ func TestVerifyDSRRSig_Valid(t *testing.T) {
 	sig := signRRset(t, parentZSK, parentSigner, []dns.RR{ds})
 	parentResp := &dns.Msg{Ns: []dns.RR{ds, sig}}
 
-	if !verifyDSRRSig([]*dns.DS{ds}, parentResp, []*dns.DNSKEY{parentZSK}) {
+	if ok, _ := verifyDSRRSig([]*dns.DS{ds}, parentResp, []*dns.DNSKEY{parentZSK}); !ok {
 		t.Error("expected true for valid DS RRSIG")
 	}
 }
@@ -263,7 +263,7 @@ func TestVerifyDSRRSig_NoRRSIG(t *testing.T) {
 	parentZSK, _ := makeZSK(t, ".")
 	parentResp := &dns.Msg{Ns: []dns.RR{ds}}
 	// No RRSIGs — function returns true.
-	if !verifyDSRRSig([]*dns.DS{ds}, parentResp, []*dns.DNSKEY{parentZSK}) {
+	if ok, _ := verifyDSRRSig([]*dns.DS{ds}, parentResp, []*dns.DNSKEY{parentZSK}); !ok {
 		t.Error("expected true when no DS RRSIGs present")
 	}
 }
@@ -278,7 +278,7 @@ func TestVerifyDSRRSig_WrongParentKey(t *testing.T) {
 	sig := signRRset(t, parentZSK, parentSigner, []dns.RR{ds})
 	parentResp := &dns.Msg{Ns: []dns.RR{ds, sig}}
 
-	if verifyDSRRSig([]*dns.DS{ds}, parentResp, []*dns.DNSKEY{wrongKey}) {
+	if ok, _ := verifyDSRRSig([]*dns.DS{ds}, parentResp, []*dns.DNSKEY{wrongKey}); ok {
 		t.Error("expected false with wrong parent key")
 	}
 }
@@ -634,8 +634,9 @@ var validationCases = []struct {
 
 	// alg-16.nsec3.uk is signed with ED448 (algorithm 16). miekg/dns has a
 	// constant for ED448 but no crypto implementation — Verify returns ErrAlg.
-	// The validator must report indeterminate with the algorithm name, not bogus.
-	{"ED448-signed zone (algorithm 16, unsupported by miekg/dns)", "alg-16.nsec3.uk.", "SOA", "indeterminate"},
+	// Per RFC 4033 §5: if a resolver doesn't support any algorithm in the DS,
+	// it MUST treat the zone as insecure (not bogus, not indeterminate).
+	{"ED448-signed zone (algorithm 16, unsupported by miekg/dns)", "alg-16.nsec3.uk.", "SOA", "insecure"},
 
 	// ── Should validate as BOGUS ───────────────────────────────────────────────
 	// missing-delegation.nsec3.uk: the shared nameserver (ns.junesta.uk.) serves
@@ -677,6 +678,13 @@ var validationCases = []struct {
 	// child zone from the SOA record in the answer and then fetches its DS →
 	// NOERROR + no DS → insecure.
 	{"mismatched delegation NS, unsigned, served by parent NS (SOA detection)", "mismatched-ns-unsigned.nsec3.uk.", "SOA", "insecure"},
+	// Regression: signed.unsigned.nsec3.uk. is a signed zone but its parent
+	// (unsigned.nsec3.uk.) has no DS in nsec3.uk., making it an unsigned delegation.
+	// The shared nameserver answers the SOA directly (AA=1), so signerZone ≠ last.zone.
+	// The DS for signed.unsigned.nsec3.uk. is served by unsigned.nsec3.uk. without a
+	// RRSIG (unsigned zone). The correct result is insecure, not bogus: we check whether
+	// the intermediate zone (unsigned.nsec3.uk.) has a DS in nsec3.uk. — it does not.
+	{"signed zone under unsigned parent, shared NS (DS has no RRSIG)", "signed.unsigned.nsec3.uk.", "SOA", "insecure"},
 
 	// ── Should be indeterminate (can't complete) ───────────────────────────────
 	// Add indeterminate test zones below:
