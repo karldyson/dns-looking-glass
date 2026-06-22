@@ -627,8 +627,10 @@ func validateChainOfTrust(chain []ResolutionStep, req *QueryRequest) (interface{
 	// For NODATA responses the answer section is empty; check the authority section too
 	// (the SOA RRSIG there is signed by the child zone's ZSK).
 	signerZone := last.zone
+	foundRRSIG := false
 	for _, rr := range append(last.resp.Answer, last.resp.Ns...) {
 		if sig, ok := rr.(*dns.RRSIG); ok {
+			foundRRSIG = true
 			if z := strings.ToLower(dns.Fqdn(sig.SignerName)); z != last.zone {
 				signerZone = z
 			}
@@ -636,13 +638,12 @@ func validateChainOfTrust(chain []ResolutionStep, req *QueryRequest) (interface{
 		}
 	}
 
-	// Fallback for unsigned child zones served by the same nameserver as the
-	// parent: if the RRSIG scan found no child zone boundary (either there are no
-	// RRSIGs at all, or all RRSIGs are signed by last.zone), look for a SOA record
-	// whose owner name is a subdomain of last.zone. A SOA owner is the zone apex,
-	// so finding one here means the server answered directly for the child without
-	// a referral and the child is unsigned. This covers both answer-section SOA
-	// (SOA queries) and authority-section SOA (NODATA responses).
+	// Fallback 1: SOA owner. When the RRSIG scan found no child zone boundary
+	// (no RRSIGs at all, or all RRSIGs are signed by last.zone), look for a SOA
+	// whose owner name is a subdomain of last.zone. A SOA owner is the zone apex;
+	// finding one here means the server answered directly for an unsigned child
+	// without a referral. Covers SOA queries (SOA in answer) and NODATA responses
+	// (SOA in authority).
 	if signerZone == last.zone {
 		qnFqdn := strings.ToLower(dns.Fqdn(req.QName))
 		if strings.HasSuffix(qnFqdn, "."+last.zone) {
@@ -654,6 +655,32 @@ func validateChainOfTrust(chain []ResolutionStep, req *QueryRequest) (interface{
 						break
 					}
 				}
+			}
+		}
+	}
+
+	// Fallback 2: qname-derived child zone. When no RRSIG and no SOA revealed a
+	// zone boundary, the response may be a positive answer (e.g. TXT, A) from an
+	// unsigned child zone served by the parent's shared nameserver — a case where
+	// neither RRSIGs nor a SOA appear in the response. Derive the child zone as
+	// the immediate delegation below last.zone on the path to the qname.
+	//
+	// This fallback is only applied when foundRRSIG=false. If an RRSIG exists but
+	// its SignerName equals last.zone, the response genuinely came from last.zone;
+	// applying the qname heuristic in that case would incorrectly redirect DS/DNSKEY
+	// fetches for a legitimately signed name in the parent zone.
+	if signerZone == last.zone && !foundRRSIG {
+		qnFqdn := strings.ToLower(strings.TrimSuffix(dns.Fqdn(req.QName), "."))
+		qnLabels := dns.SplitDomainName(qnFqdn)
+		zoneLabels := dns.SplitDomainName(strings.TrimSuffix(last.zone, "."))
+		if len(qnLabels) > len(zoneLabels) {
+			// qnLabels[childIdx:] gives the labels of the immediate child zone
+			// (one label deeper than last.zone on the path to the qname).
+			childIdx := len(qnLabels) - len(zoneLabels) - 1
+			childZone := dns.Fqdn(strings.Join(qnLabels[childIdx:], "."))
+			if childZone != last.zone {
+				signerZone = childZone
+				dbg("validate: child zone %s inferred from qname (no RRSIG, no SOA — unsigned child?)", signerZone)
 			}
 		}
 	}
@@ -756,23 +783,52 @@ func validateChainOfTrust(chain []ResolutionStep, req *QueryRequest) (interface{
 							}
 						}
 					}
-					// Verify at least one NSEC3/NSEC RRSIG with the parent's validated keys.
-					anyVerified := false
-					for _, sig := range denialSigs {
-						rrset := rrsetForSig(denialRRs, sig)
-						if len(rrset) == 0 {
-							continue
-						}
-						for _, key := range keys {
-							if key.KeyTag() == sig.KeyTag {
-								if verifySig(sig, key, rrset) == nil {
-									anyVerified = true
-									break
+					// Verify at least one NSEC/NSEC3 RRSIG using whichever zone's keys signed
+					// it. The signing zone may differ from last.zone: when a server is
+					// authoritative for multiple zones at different depths (e.g. nsec3.uk.
+					// and nsec.nsec3.uk. share nameservers), it can answer a DS fetch for
+					// a grandchild with an NXDOMAIN whose denial records are signed by an
+					// intermediate zone's ZSK, not by last.zone's ZSK. Using the RRSIG
+					// SignerName to drive key selection is the correct generic approach.
+					tryVerifyDenial := func(keysForSig []*dns.DNSKEY) bool {
+						for _, sig := range denialSigs {
+							rrset := rrsetForSig(denialRRs, sig)
+							if len(rrset) == 0 {
+								continue
+							}
+							for _, key := range keysForSig {
+								if key.KeyTag() == sig.KeyTag {
+									if verifySig(sig, key, rrset) == nil {
+										return true
+									}
 								}
 							}
 						}
-						if anyVerified {
-							break
+						return false
+					}
+					anyVerified := tryVerifyDenial(keys)
+					if !anyVerified && len(denialSigs) > 0 {
+						// keys didn't work — check whether the RRSIG SignerName points to an
+						// intermediate zone that was skipped. Validate that zone's chain from
+						// last.zone and re-try with its keys.
+						var denialSigner string
+						for _, sig := range denialSigs {
+							if sn := strings.ToLower(dns.Fqdn(sig.SignerName)); sn != last.zone {
+								denialSigner = sn
+								break
+							}
+						}
+						if denialSigner != "" {
+							dbg("validate: denial RRSIG SignerName %q ≠ last.zone %q — validating intermediate zone", denialSigner, last.zone)
+							dsStepHeld := extraSteps[dsStepIdx]
+							extraSteps = extraSteps[:dsStepIdx]
+							intKeys, intSteps, intOK, intInsecure := validateIntermediateZones(last.zone, denialSigner, last.ns, keys, nsidRequested)
+							extraSteps = append(extraSteps, intSteps...)
+							extraSteps = append(extraSteps, dsStepHeld)
+							dsStepIdx = len(extraSteps) - 1
+							if intOK && !intInsecure {
+								anyVerified = tryVerifyDenial(intKeys)
+							}
 						}
 					}
 					if anyVerified {
@@ -785,26 +841,36 @@ func validateChainOfTrust(chain []ResolutionStep, req *QueryRequest) (interface{
 							return false, extraSteps
 						}
 						// NOERROR: check whether the parent has an NS record at the child zone name.
+						// nameProven is true when an NSEC3/NSEC exactly covers the zone name
+						// (the name EXISTS in the parent's zone data). nameHasNS tracks whether
+						// that exact record also has the NS bit set.
+						//
+						// When nameProven=false the denial RRSIGs verified but no exact NSEC3/NSEC
+						// matched the name — this happens in NSEC3 opt-out zones where unsigned
+						// delegations are not represented in the NSEC3 chain. In that case the
+						// absence of NS cannot be concluded; fall through to "insecure".
 						nameHasNS := false
+						nameProven := false
 						for _, n3 := range dsNSEC3s {
 							if n3.Match(signerZone) {
+								nameProven = true
 								nameHasNS = typeInNSEC3Bitmap(n3, dns.TypeNS)
 								break
 							}
 						}
-						if !nameHasNS {
+						if !nameProven {
 							for _, n := range dsNSECs {
 								if strings.EqualFold(dns.Fqdn(n.Hdr.Name), dns.Fqdn(signerZone)) {
+									nameProven = true
 									nameHasNS = typeInNSECBitmap(n, dns.TypeNS)
 									break
 								}
 							}
 						}
-						if !nameHasNS {
-							// Parent's denial records prove either the name doesn't exist at
-							// all, or it exists without NS records — no valid delegation. Any
-							// zone "served" by the shared nameserver is outside the secure
-							// hierarchy.
+						if nameProven && !nameHasNS {
+							// Parent's denial records prove the name exists without NS records —
+							// no valid delegation. Any zone "served" by the shared nameserver
+							// is outside the secure hierarchy.
 							dbg("validate: parent denial records show no NS delegation for %s → BOGUS", signerZone)
 							extraSteps[len(extraSteps)-1].StepNote += fmt.Sprintf(
 								" — parent NSEC3/NSEC proves no NS delegation for %s; zone not in secure hierarchy — BOGUS", signerZone)

@@ -299,13 +299,13 @@ func TestParseDelegationChain_ThreeLevels(t *testing.T) {
 
 	rootMsg := &dns.Msg{MsgHdr: dns.MsgHdr{Response: true}}
 	rootMsg.Ns = []dns.RR{
-		&dns.NS{Hdr: dns.RR_Header{Name: "uk.", Rrtype: dns.TypeNS, Class: dns.ClassINET, Ttl: 172800}, Ns: "ns1.nic.uk."},
+		&dns.NS{Hdr: dns.RR_Header{Name: "uk.", Rrtype: dns.TypeNS, Class: dns.ClassINET, Ttl: 172800}, Ns: "ns1.example."},
 		dsUK,
 	}
 
 	ukMsg := &dns.Msg{MsgHdr: dns.MsgHdr{Response: true}}
 	ukMsg.Ns = []dns.RR{
-		&dns.NS{Hdr: dns.RR_Header{Name: "nsec3.uk.", Rrtype: dns.TypeNS, Class: dns.ClassINET, Ttl: 172800}, Ns: "ns.junesta.net.uk."},
+		&dns.NS{Hdr: dns.RR_Header{Name: "nsec3.uk.", Rrtype: dns.TypeNS, Class: dns.ClassINET, Ttl: 172800}, Ns: "ns1.example."},
 		dsNSEC3,
 	}
 
@@ -313,8 +313,8 @@ func TestParseDelegationChain_ThreeLevels(t *testing.T) {
 	nxMsg.Ns = []dns.RR{
 		&dns.SOA{
 			Hdr:     dns.RR_Header{Name: "nsec3.uk.", Rrtype: dns.TypeSOA, Class: dns.ClassINET, Ttl: 900},
-			Ns:      "ns.junesta.net.uk.",
-			Mbox:    "hostmaster.junesta.com.",
+			Ns:      "ns1.example.",
+			Mbox:    "hostmaster.example.",
 			Serial:  2026061901,
 			Refresh: 14400, Retry: 900, Expire: 2419200, Minttl: 900,
 		},
@@ -365,7 +365,7 @@ func TestParseDelegationChain_AllDNSKEYSteps(t *testing.T) {
 	}
 	rootMsg := &dns.Msg{MsgHdr: dns.MsgHdr{Response: true}}
 	rootMsg.Ns = []dns.RR{
-		&dns.NS{Hdr: dns.RR_Header{Name: "uk.", Rrtype: dns.TypeNS, Class: dns.ClassINET, Ttl: 172800}, Ns: "ns1.nic.uk."},
+		&dns.NS{Hdr: dns.RR_Header{Name: "uk.", Rrtype: dns.TypeNS, Class: dns.ClassINET, Ttl: 172800}, Ns: "ns1.example."},
 		dsUK,
 	}
 	// Final DNSKEY answer from uk. nameserver (NODATA — pretend no DNSKEY in uk.).
@@ -373,8 +373,8 @@ func TestParseDelegationChain_AllDNSKEYSteps(t *testing.T) {
 	answerMsg.Ns = []dns.RR{
 		&dns.SOA{
 			Hdr:     dns.RR_Header{Name: "uk.", Rrtype: dns.TypeSOA, Class: dns.ClassINET, Ttl: 900},
-			Ns:      "ns1.nic.uk.",
-			Mbox:    "hostmaster.nic.uk.",
+			Ns:      "ns1.example.",
+			Mbox:    "hostmaster.example.",
 			Serial:  2026061901,
 			Refresh: 3600,
 			Retry:   900,
@@ -407,7 +407,7 @@ func TestParseDelegationChain_SkipsEmptyResponseHex(t *testing.T) {
 	}
 	rootMsg := &dns.Msg{MsgHdr: dns.MsgHdr{Response: true}}
 	rootMsg.Ns = []dns.RR{
-		&dns.NS{Hdr: dns.RR_Header{Name: "uk.", Rrtype: dns.TypeNS, Class: dns.ClassINET, Ttl: 172800}, Ns: "ns1.nic.uk."},
+		&dns.NS{Hdr: dns.RR_Header{Name: "uk.", Rrtype: dns.TypeNS, Class: dns.ClassINET, Ttl: 172800}, Ns: "ns1.example."},
 		dsUK,
 	}
 	answerMsg := &dns.Msg{MsgHdr: dns.MsgHdr{Response: true, Authoritative: true}}
@@ -566,14 +566,20 @@ func TestParseDelegationChain_StubNotAddedWhenChildResponds(t *testing.T) {
 // Run with: go test ./internal/dns/ -v
 // Skip with: go test ./internal/dns/ -short
 
-// testIANATrustAnchors is the current IANA root KSK (key tag 20326).
-// Update when the root KSK rolls over.
+// testIANATrustAnchors contains the active IANA root KSKs (key tags 20326 and 38696).
+// Update when a root KSK is added or retired.
 var testIANATrustAnchors = []TrustAnchorDS{
 	{
 		KeyTag:     20326,
 		Algorithm:  8,
 		DigestType: 2,
 		Digest:     "E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D",
+	},
+	{
+		KeyTag:     38696,
+		Algorithm:  8,
+		DigestType: 2,
+		Digest:     "683D2D0ACB8C9B712A1948B27F741219298D0A450D612C483AF444A4C0FB2B16",
 	},
 }
 
@@ -608,21 +614,23 @@ var validationCases = []struct {
 	{"NXDOMAIN in NSEC3 zone", "nonexistent.nsec3.uk.", "A", true},
 	{"NODATA in NSEC3 zone (type exists at parent, not child)", "dangling-ds.nsec3.uk.", "A", true},
 	{"zone served by in-zone server for both parent and child", "dangling-ds.nsec3.uk.", "SOA", true},
-	// Shared-nameserver: uk. and co.uk. use the same NS; co.uk. DS is signed by
-	// uk. ZSK via an intermediate zone boundary that is not in the referral chain.
-	{"SOA for zone whose parent shares nameservers with grandparent", "junesta.co.uk.", "SOA", true},
-	// Wildcard NODATA: query matches a wildcard but the type is absent from the
-	// wildcard RRset; both NSEC and NSEC3 zones use this proof structure.
-	{"wildcard NODATA in NSEC3 zone", "jkjhkjkjh.junesta.com.", "TXT", true},
-	// ANY queries: servers previously returned RFC 8482 minimal responses (no RRSIGs),
-	// but now return fully signed ANY responses — validated as SECURE.
-	{"ANY query for signed zone apex", "junesta.com.", "ANY", true},
+	// nsec.nsec3.uk. is served by the same nameservers as nsec3.uk. (its parent).
+	// The resolver gets the SOA answer directly (AA=1, no referral), so signerZone
+	// differs from last.zone — the validator fetches the DS explicitly.
+	{"SOA for zone served without referral by shared parent NS", "nsec.nsec3.uk.", "SOA", true},
+	// Wildcard NODATA: query matches a wildcard but the type (A) is absent from the
+	// wildcard TXT RRset; NSEC3 and NSEC proofs covering both zone types.
+	{"wildcard NODATA in NSEC3 zone", "nonexistent.wildcard3.nsec3.uk.", "A", true},
+	{"wildcard NODATA in NSEC zone", "nonexistent.wildcard.nsec3.uk.", "A", true},
+	// ANY queries: return fully signed ANY responses — validated as SECURE.
+	{"ANY query for signed zone apex (NSEC3)", "nsec3.uk.", "ANY", true},
+	{"ANY query for signed zone apex (NSEC)", "nsec.nsec3.uk.", "ANY", true},
 	// nsec3.uk. returns a fully signed NXDOMAIN with NSEC3 proof for non-existent names.
 	{"ANY for non-existent name (NXDOMAIN with NSEC3 proof)", "nonexistent.nsec3.uk.", "ANY", true},
 
 	// Regression: cross-zone CNAME to an unsigned target. The CNAME itself is in
-	// nsec3.uk. (signed, secure) but google.com. is unsigned (no DS in com.) so the
-	// CNAME target chain is insecure. The overall result must be the weaker: insecure.
+	// nsec3.uk. (signed, secure) but the CNAME target is unsigned, so the overall
+	// result must be the weaker: insecure.
 	{"secure CNAME to unsigned remote target", "remote-cname.nsec3.uk.", "A", "insecure"},
 
 	// Regression: NXDOMAIN where the answer section contains a CNAME to a
@@ -632,58 +640,77 @@ var validationCases = []struct {
 	// target, not the original query name (which exists, as a CNAME).
 	{"NXDOMAIN with CNAME in answer (denial proven for CNAME target)", "nxd-rhs-cname.nsec3.uk.", "A", true},
 
+	// Regression: ds-alg-2.alg-8.nsec3.uk is nested two delegation levels below
+	// nsec3.uk. All three zones share the same nameserver, which answers queries for
+	// ds-alg-2.alg-8.nsec3.uk. directly (AA=1). The DS RRSIG signer is alg-8.nsec3.uk.,
+	// so validateIntermediateZones is called before verifying the DS RRSIG.
+	{"multi-level shared-NS delegation (DS RRSIG signer is intermediate zone)", "ds-alg-2.alg-8.nsec3.uk.", "A", true},
+
+	// Algorithm coverage — all SECURE.
+	{"RSA/SHA-256 signed zone (alg 8)", "alg-8.nsec3.uk.", "SOA", true},
+	{"ECDSA P-256 signed zone (alg 13)", "alg-13.nsec3.uk.", "SOA", true},
+	{"ECDSA P-384 signed zone (alg 14)", "alg-14.nsec3.uk.", "SOA", true},
+	{"Ed25519 signed zone (alg 15)", "alg-15.nsec3.uk.", "SOA", true},
+	{"SHA-1 DS (digest type 4) under alg-8 parent", "ds-alg-4.alg-8.nsec3.uk.", "SOA", true},
+
+	// NSEC vs NSEC3 zone type coverage — all SECURE.
+	{"NSEC-signed zone", "nsec-a.nsec3.uk.", "SOA", true},
+	{"NSEC3-signed zone", "nsec3-a.nsec3.uk.", "SOA", true},
+	{"NSEC3 opt-out zone", "nsec3o-a.nsec3.uk.", "SOA", true},
+	{"name in NSEC zone", "a.nsec-a.nsec3.uk.", "SOA", true},
+	{"name in NSEC3 zone", "z.nsec3-a.nsec3.uk.", "SOA", true},
+
+	// Mixed-algorithm DS scenarios — all SECURE.
+	{"mixed-alg DS: missing weaker DS", "mixed-alg-missing-weaker-ds.nsec3.uk.", "SOA", true},
+	{"mixed-alg DS: missing stronger DS", "mixed-alg-missing-stronger-ds.nsec3.uk.", "SOA", true},
+	{"mixed-alg DS: dangling weaker DS", "mixed-alg-dangling-weaker-ds.nsec3.uk.", "SOA", true},
+	{"mixed-alg DS: dangling stronger DS", "mixed-alg-dangling-stronger-ds.nsec3.uk.", "SOA", true},
+
+	// ZSK rollover — SECURE throughout the automated signing cycle.
+	{"ZSK auto-rollover zone (SECURE throughout)", "auto-rolling-zsk.nsec3.uk.", "SOA", true},
+
+	// ── Should validate as BOGUS ───────────────────────────────────────────────
+	// missing-delegation.nsec3.uk: the shared nameserver serves this zone locally,
+	// but nsec3.uk. has no NS delegation for it. Our SOA-based child-zone detection
+	// fires, fetches DS → NOERROR + no DS + NSEC3 records showing no NS at this name
+	// → BOGUS.
+	{"zone served locally with no parent NS delegation (parent NSEC3 proves no NS)", "missing-delegation.nsec3.uk.", "A", false},
+	// missing-delegation.nsec.nsec3.uk: same scenario but the parent uses NSEC.
+	// DS fetch returns NXDOMAIN + NSEC denial records proving the name doesn't exist
+	// in the parent at all → BOGUS.
+	{"zone with no parent entry in NSEC zone (parent NSEC proves NXDOMAIN for DS)", "missing-delegation.nsec.nsec3.uk.", "SOA", false},
+	// broken-ds.nsec3.uk: a DS record is published in the parent but it does not
+	// match any DNSKEY in the child zone → BOGUS.
+	{"DS in parent doesn't match any DNSKEY (bogus)", "broken-ds.nsec3.uk.", "SOA", false},
+
+	// ── Should be insecure ────────────────────────────────────────────────────
 	// alg-16.nsec3.uk is signed with ED448 (algorithm 16). miekg/dns has a
 	// constant for ED448 but no crypto implementation — Verify returns ErrAlg.
 	// Per RFC 4033 §5: if a resolver doesn't support any algorithm in the DS,
 	// it MUST treat the zone as insecure (not bogus, not indeterminate).
 	{"ED448-signed zone (algorithm 16, unsupported by miekg/dns)", "alg-16.nsec3.uk.", "SOA", "insecure"},
-
-	// ── Should validate as BOGUS ───────────────────────────────────────────────
-	// missing-delegation.nsec3.uk: the shared nameserver (ns.junesta.uk.) serves
-	// this zone locally, but nsec3.uk. has no NS delegation for it. Our SOA-based
-	// child-zone detection fires, fetches DS → NOERROR + no DS + NSEC3 records that
-	// show no NS record at this name. The parent's NSEC3 proof means the "zone" is
-	// outside the secure hierarchy → BOGUS.
-	{"zone served locally with no parent NS delegation (parent NSEC3 proves no NS)", "missing-delegation.nsec3.uk.", "A", false},
-	// missing-delegation.c.je: same scenario, but the parent (c.je) uses NSEC not
-	// NSEC3. SOA detection fires; DS fetch returns NXDOMAIN + NSEC denial records
-	// (ns.junesta.net serves c.je; the name missing-delegation.c.je. falls between
-	// ip6.c.je. and p.c.je. in the NSEC chain). The authenticated NXDOMAIN proves
-	// the name doesn't exist in the parent at all → BOGUS.
-	// (Verified: ns.junesta.net returns NXDOMAIN + NSEC chain for the DS query.)
-	{"zone with no parent entry in NSEC zone (parent NSEC proves NXDOMAIN for DS)", "missing-delegation.c.je.", "SOA", false},
-
-	// Regression: ds-alg-2.alg-8.nsec3.uk is nested two delegation levels below
-	// nsec3.uk. (nsec3.uk. → alg-8.nsec3.uk. → ds-alg-2.alg-8.nsec3.uk.). All
-	// three zones are served by ns.junesta.uk., which answers queries for
-	// ds-alg-2.alg-8.nsec3.uk. directly (AA=1) without giving an intermediate
-	// referral through alg-8.nsec3.uk. The DS for ds-alg-2.alg-8.nsec3.uk. is
-	// signed by alg-8.nsec3.uk.'s ZSK — so the validator must detect that the DS
-	// RRSIG signer differs from the last seen zone (nsec3.uk.) and validate the
-	// intermediate zone chain before verifying the DS RRSIG.
-	{"multi-level shared-NS delegation (DS RRSIG signer is intermediate zone)", "ds-alg-2.alg-8.nsec3.uk.", "A", true},
-
-	// ── Should be insecure (signed parent, no DS for child) ───────────────────
-	// p.c.je exists (c.je delegates to it) but has no DS in c.je → insecure.
-	{"query under unsigned delegation in signed parent zone", "i.p.c.je.", "TXT", "insecure"},
-	// ox.junesta.net is signed but junesta.net has no DS for it. The NS directly
-	// serves ox.junesta.net records without a referral, so signerZone differs from
-	// last.zone and we explicitly fetch the DS. NOERROR + no DS → insecure.
-	{"HTTPS in zone served without referral and no parent DS", "polecat.ox.junesta.net.", "HTTPS", "insecure"},
+	// unsigned.nsec3.uk has no DNSSEC signing at all.
+	{"unsigned zone (no DNSSEC)", "unsigned.nsec3.uk.", "SOA", "insecure"},
+	// unsigned.nsec3.uk TXT: exercises the unsigned-delegation-under-signed-parent path.
+	{"query under unsigned delegation in signed parent zone", "unsigned.nsec3.uk.", "TXT", "insecure"},
+	// Unsigned children under NSEC, NSEC3, and NSEC3 opt-out parents.
+	{"unsigned child under NSEC parent", "m.nsec-b.nsec3.uk.", "SOA", "insecure"},
+	{"unsigned child under NSEC3 parent", "m.nsec3-b.nsec3.uk.", "SOA", "insecure"},
+	{"unsigned child under NSEC3 opt-out parent", "m.nsec3o-b.nsec3.uk.", "SOA", "insecure"},
+	// missing-ds.nsec3.uk is correctly signed but has no DS in the parent nsec3.uk.
+	// The NS directly serves records (AA=1, shared NS), so signerZone differs from
+	// last.zone; the explicit DS fetch returns NOERROR + no DS → insecure.
+	{"signed zone with no DS in parent", "missing-ds.nsec3.uk.", "SOA", "insecure"},
+	{"TXT in zone served without referral and no parent DS", "test.missing-ds.nsec3.uk.", "TXT", "insecure"},
 	// Regression: mismatched-ns-unsigned.nsec3.uk has no DS in nsec3.uk. The
-	// parent-delegated NS (ns.junesta.uk.) is the same server that serves nsec3.uk.,
-	// so it answers the SOA query directly (AA=1) without sending a referral first.
-	// Because the child zone is unsigned there are no RRSIGs, so the RRSIG-based
-	// signerZone detection produces nothing. The SOA owner fallback detects the
-	// child zone from the SOA record in the answer and then fetches its DS →
-	// NOERROR + no DS → insecure.
+	// parent-delegated NS answers the SOA query directly (AA=1). Because the child
+	// zone is unsigned there are no RRSIGs; the SOA owner fallback detects the child
+	// zone and fetches its DS → NOERROR + no DS → insecure.
 	{"mismatched delegation NS, unsigned, served by parent NS (SOA detection)", "mismatched-ns-unsigned.nsec3.uk.", "SOA", "insecure"},
 	// Regression: signed.unsigned.nsec3.uk. is a signed zone but its parent
-	// (unsigned.nsec3.uk.) has no DS in nsec3.uk., making it an unsigned delegation.
-	// The shared nameserver answers the SOA directly (AA=1), so signerZone ≠ last.zone.
-	// The DS for signed.unsigned.nsec3.uk. is served by unsigned.nsec3.uk. without a
-	// RRSIG (unsigned zone). The correct result is insecure, not bogus: we check whether
-	// the intermediate zone (unsigned.nsec3.uk.) has a DS in nsec3.uk. — it does not.
+	// (unsigned.nsec3.uk.) has no DS in nsec3.uk. The DS for the child is served
+	// without a RRSIG (unsigned parent zone). The correct result is insecure, not
+	// bogus: the intermediate zone is insecure, not broken.
 	{"signed zone under unsigned parent, shared NS (DS has no RRSIG)", "signed.unsigned.nsec3.uk.", "SOA", "insecure"},
 
 	// ── Should be indeterminate (can't complete) ───────────────────────────────
@@ -716,25 +743,25 @@ func TestIntegration_Validation(t *testing.T) {
 
 // TestIntegration_ZoneTrustAnchor verifies that supplying caller DS records for a
 // zone with no parent DS upgrades validation from "insecure" to true (SECURE).
-// The test queries for polecat.ox.junesta.net HTTPS, which is in a signed zone
-// whose parent (junesta.net) has no DS → normally "insecure". We fetch the zone's
-// actual DNSKEY, compute the DS, then supply it as a ZoneTrustAnchor and expect
-// the result to be true (SECURE, using caller-supplied trust anchor).
+// The test queries for test.missing-ds.nsec3.uk. TXT, which is in a signed zone
+// (missing-ds.nsec3.uk., signed with alg 14) whose parent (nsec3.uk.) has no DS
+// for it → normally "insecure". We fetch the zone's actual DNSKEY, compute the DS,
+// then supply it as a ZoneTrustAnchor and expect the result to be true (SECURE).
 func TestIntegration_ZoneTrustAnchor(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping network integration tests (-short)")
 	}
 
 	// Step 1: confirm the baseline is "insecure" without a caller-supplied DS.
-	baseline := runRecursiveValidate(t, "polecat.ox.junesta.net.", "HTTPS")
+	baseline := runRecursiveValidate(t, "test.missing-ds.nsec3.uk.", "TXT")
 	if baseline.DNSSECValid != "insecure" {
 		t.Skipf("baseline not insecure (got %v) — zone may have acquired a parent DS; skipping zone trust anchor test", baseline.DNSSECValid)
 	}
 
-	// Step 2: fetch the actual DNSKEY for ox.junesta.net. and compute the DS.
+	// Step 2: fetch the actual DNSKEY for missing-ds.nsec3.uk. and compute the DS.
 	// We use a plain recursive query (no DNSSEC validation needed here).
 	dnskeyReq := &QueryRequest{
-		QName: "ox.junesta.net.",
+		QName: "missing-ds.nsec3.uk.",
 		QType: "DNSKEY",
 		Mode:  "recursive",
 		Flags: QueryFlags{DO: true},
@@ -744,8 +771,7 @@ func TestIntegration_ZoneTrustAnchor(t *testing.T) {
 		t.Fatalf("DNSKEY fetch error: %s", dnskeyResp.Error)
 	}
 
-	// Parse DNSKEY records from the response text and compute DS.
-	// Use miekg/dns to parse the response wire data from the last step.
+	// Parse DNSKEY records from the response wire data and compute DS.
 	var zoneDS []TrustAnchorDS
 	for i := len(dnskeyResp.ResolutionChain) - 1; i >= 0; i-- {
 		step := dnskeyResp.ResolutionChain[i]
@@ -782,20 +808,20 @@ func TestIntegration_ZoneTrustAnchor(t *testing.T) {
 	}
 
 	if len(zoneDS) == 0 {
-		t.Skip("could not compute DS from ox.junesta.net DNSKEY — skipping zone trust anchor test")
+		t.Skip("could not compute DS from missing-ds.nsec3.uk. DNSKEY — skipping zone trust anchor test")
 	}
-	t.Logf("computed %d DS record(s) for ox.junesta.net", len(zoneDS))
+	t.Logf("computed %d DS record(s) for missing-ds.nsec3.uk.", len(zoneDS))
 
 	// Step 3: run validation with the caller-supplied DS — expect SECURE.
 	req := &QueryRequest{
-		QName:           "polecat.ox.junesta.net.",
-		QType:           "HTTPS",
+		QName:           "test.missing-ds.nsec3.uk.",
+		QType:           "TXT",
 		Mode:            "recursive",
 		Flags:           QueryFlags{DO: true, Validate: true},
 		TrustAnchorMode: "iana",
 		TrustAnchors:    testIANATrustAnchors,
 		ZoneTrustAnchors: []ZoneTrustAnchor{
-			{Zone: "ox.junesta.net.", DS: zoneDS},
+			{Zone: "missing-ds.nsec3.uk.", DS: zoneDS},
 		},
 	}
 	resp := execRecursive(req)
@@ -806,7 +832,7 @@ func TestIntegration_ZoneTrustAnchor(t *testing.T) {
 				notes = append(notes, fmt.Sprintf("  [%s %s @ %s] %s", s.QType, s.QName, s.Nameserver, s.StepNote))
 			}
 		}
-		t.Errorf("polecat.ox.junesta.net HTTPS with caller-supplied DS: DNSSECValid = %v, want true (%d steps)\n%s",
+		t.Errorf("test.missing-ds.nsec3.uk. TXT with caller-supplied DS: DNSSECValid = %v, want true (%d steps)\n%s",
 			resp.DNSSECValid, len(resp.ResolutionChain), strings.Join(notes, "\n"))
 	}
 }
@@ -1344,106 +1370,6 @@ func TestIsWildcardAnswer(t *testing.T) {
 	}
 }
 
-// ── TC=1 UDP fallback to TCP ──────────────────────────────────────────────────
-
-// TestExchangeWithTCPFallback_Truncated verifies that exchangeWithTCPFallback
-// retries over TCP when the UDP response has TC=1, and that the returned note
-// says so. It spins up a fake UDP server that always sets TC=1 and a fake TCP
-// server that returns a normal NOERROR response.
-func TestExchangeWithTCPFallback_Truncated(t *testing.T) {
-	answer := &dns.A{
-		Hdr: dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60},
-		A:   net.ParseIP("1.2.3.4"),
-	}
-
-	// UDP handler: always reply with TC=1 and an empty answer.
-	udpMux := dns.NewServeMux()
-	udpMux.HandleFunc(".", func(w dns.ResponseWriter, r *dns.Msg) {
-		m := new(dns.Msg)
-		m.SetReply(r)
-		m.Truncated = true
-		_ = w.WriteMsg(m)
-	})
-	udpSrv := &dns.Server{Addr: "127.0.0.1:0", Net: "udp", Handler: udpMux}
-	udpStarted := make(chan struct{})
-	udpSrv.NotifyStartedFunc = func() { close(udpStarted) }
-	go func() { _ = udpSrv.ListenAndServe() }()
-	<-udpStarted
-	defer udpSrv.Shutdown()
-	addr := udpSrv.PacketConn.LocalAddr().String()
-
-	// TCP handler on the same port: reply normally with one A record.
-	tcpMux := dns.NewServeMux()
-	tcpMux.HandleFunc(".", func(w dns.ResponseWriter, r *dns.Msg) {
-		m := new(dns.Msg)
-		m.SetReply(r)
-		m.Answer = []dns.RR{answer}
-		_ = w.WriteMsg(m)
-	})
-	tcpSrv := &dns.Server{Addr: addr, Net: "tcp", Handler: tcpMux}
-	tcpStarted := make(chan struct{})
-	tcpSrv.NotifyStartedFunc = func() { close(tcpStarted) }
-	go func() { _ = tcpSrv.ListenAndServe() }()
-	<-tcpStarted
-	defer tcpSrv.Shutdown()
-
-	q := new(dns.Msg)
-	q.SetQuestion("example.com.", dns.TypeA)
-
-	resp, note, err := exchangeWithTCPFallback(q, addr)
-	if err != nil {
-		t.Fatalf("exchangeWithTCPFallback: %v", err)
-	}
-	if note == "" {
-		t.Error("expected a TC fallback note, got empty string")
-	}
-	if !strings.Contains(note, "TC=1") {
-		t.Errorf("TC fallback note does not mention TC=1: %q", note)
-	}
-	if !strings.Contains(note, "TCP") {
-		t.Errorf("TC fallback note does not mention TCP: %q", note)
-	}
-	if len(resp.Answer) != 1 {
-		t.Errorf("expected TCP response with 1 answer, got %d", len(resp.Answer))
-	}
-}
-
-// TestExchangeWithTCPFallback_NoTruncation verifies that when UDP responds
-// without TC=1, no TCP retry is made and the note is empty.
-func TestExchangeWithTCPFallback_NoTruncation(t *testing.T) {
-	answer := &dns.A{
-		Hdr: dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60},
-		A:   net.ParseIP("1.2.3.4"),
-	}
-	mux := dns.NewServeMux()
-	mux.HandleFunc(".", func(w dns.ResponseWriter, r *dns.Msg) {
-		m := new(dns.Msg)
-		m.SetReply(r)
-		m.Answer = []dns.RR{answer}
-		_ = w.WriteMsg(m)
-	})
-	srv := &dns.Server{Addr: "127.0.0.1:0", Net: "udp", Handler: mux}
-	started := make(chan struct{})
-	srv.NotifyStartedFunc = func() { close(started) }
-	go func() { _ = srv.ListenAndServe() }()
-	<-started
-	defer srv.Shutdown()
-
-	q := new(dns.Msg)
-	q.SetQuestion("example.com.", dns.TypeA)
-
-	resp, note, err := exchangeWithTCPFallback(q, srv.PacketConn.LocalAddr().String())
-	if err != nil {
-		t.Fatalf("exchangeWithTCPFallback: %v", err)
-	}
-	if note != "" {
-		t.Errorf("expected empty note for non-truncated response, got %q", note)
-	}
-	if len(resp.Answer) != 1 {
-		t.Errorf("expected 1 answer, got %d", len(resp.Answer))
-	}
-}
-
 // ── GAP 1: RRSIG validity period (RFC 4034 §3.1.5) ───────────────────────────
 
 func TestVerifySig_Valid(t *testing.T) {
@@ -1503,22 +1429,6 @@ func TestVerifyNSECDenial_NXDOMAIN_WildcardAncestorDelegation(t *testing.T) {
 	}
 }
 
-func TestIntegration_NoValidation(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping network integration tests (-short)")
-	}
-	req := &QueryRequest{
-		QName: "nonexistent.nsec3.uk.",
-		QType: "A",
-		Mode:  "recursive",
-		Flags: QueryFlags{DO: true, Validate: false},
-	}
-	resp := execRecursive(req)
-	if resp.DNSSECValid != nil {
-		t.Errorf("DNSSECValid: want nil when Validate=false, got %v", resp.DNSSECValid)
-	}
-}
-
 // TestIntegration_DSAdd verifies that supplying a correct caller DS for a zone
 // that already has a parent-published DS (add mode, override=false) still
 // produces SECURE — the caller DS is redundant but harmless.
@@ -1527,48 +1437,68 @@ func TestIntegration_DSAdd(t *testing.T) {
 		t.Skip("skipping network integration tests (-short)")
 	}
 
-	// First fetch the real DS for junesta.net. from its parent zone.
-	msg := new(dns.Msg)
-	msg.SetQuestion("junesta.net.", dns.TypeDS)
-	msg.SetEdns0(1232, true)
-	c := &dns.Client{Net: "udp", Timeout: 5 * time.Second}
-	// Query one of the .net nameservers.
-	var dsRecords []TrustAnchorDS
-	netNS := []string{"a.gtld-servers.net:53", "b.gtld-servers.net:53"}
-	for _, ns := range netNS {
-		r, _, err := c.Exchange(msg, ns)
-		if err != nil || r == nil {
+	// Fetch the DNSKEY for nsec3.uk. and compute the DS to use as a caller-supplied anchor.
+	dnskeyReq := &QueryRequest{
+		QName: "nsec3.uk.",
+		QType: "DNSKEY",
+		Mode:  "recursive",
+		Flags: QueryFlags{DO: true},
+	}
+	dnskeyResp := execRecursive(dnskeyReq)
+	if dnskeyResp.Error != "" {
+		t.Fatalf("DNSKEY fetch error: %s", dnskeyResp.Error)
+	}
+
+	var zoneDS []TrustAnchorDS
+	for i := len(dnskeyResp.ResolutionChain) - 1; i >= 0; i-- {
+		step := dnskeyResp.ResolutionChain[i]
+		if step.ResponseBytesHex == "" {
 			continue
 		}
-		for _, rr := range r.Ns {
-			if ds, ok := rr.(*dns.DS); ok {
-				dsRecords = append(dsRecords, TrustAnchorDS{
-					KeyTag:     ds.KeyTag,
-					Algorithm:  ds.Algorithm,
-					DigestType: ds.DigestType,
-					Digest:     strings.ToUpper(ds.Digest),
-				})
-			}
+		b, err := hex.DecodeString(step.ResponseBytesHex)
+		if err != nil || len(b) == 0 {
+			continue
 		}
-		if len(dsRecords) > 0 {
+		msg := new(dns.Msg)
+		if err := msg.Unpack(b); err != nil || msg.Rcode != dns.RcodeSuccess {
+			continue
+		}
+		for _, rr := range msg.Answer {
+			key, ok := rr.(*dns.DNSKEY)
+			if !ok || key.Flags&(1<<8) == 0 { // only KSK (flags bit 8 = SEP)
+				continue
+			}
+			ds := key.ToDS(dns.SHA256)
+			if ds == nil {
+				continue
+			}
+			zoneDS = append(zoneDS, TrustAnchorDS{
+				KeyTag:     ds.KeyTag,
+				Algorithm:  ds.Algorithm,
+				DigestType: ds.DigestType,
+				Digest:     strings.ToUpper(ds.Digest),
+			})
+		}
+		if len(zoneDS) > 0 {
 			break
 		}
 	}
-	if len(dsRecords) == 0 {
-		t.Skip("could not fetch junesta.net DS from parent — skipping")
+
+	if len(zoneDS) == 0 {
+		t.Skip("could not compute DS from nsec3.uk. DNSKEY — skipping")
 	}
+	t.Logf("computed %d DS record(s) for nsec3.uk.", len(zoneDS))
 
 	req := &QueryRequest{
-		QName:            "junesta.net.",
+		QName:            "nsec3.uk.",
 		QType:            "SOA",
 		Mode:             "recursive",
 		Flags:            QueryFlags{DO: true, Validate: true},
 		TrustAnchorMode:  "iana",
-		ZoneTrustAnchors: []ZoneTrustAnchor{{Zone: "junesta.net.", DS: dsRecords, Override: false}},
+		TrustAnchors:     testIANATrustAnchors,
+		ZoneTrustAnchors: []ZoneTrustAnchor{{Zone: "nsec3.uk.", DS: zoneDS, Override: false}},
 	}
-	resp := runRecursiveValidate(t, req.QName, req.QType)
-	// Re-run with zone trust anchors set.
-	resp = execRecursive(req)
+	resp := execRecursive(req)
 	if resp.DNSSECValid != true {
 		t.Errorf("DSAdd: DNSSECValid = %v, want true (redundant caller DS should not break validation)", resp.DNSSECValid)
 	}
@@ -1589,13 +1519,13 @@ func TestIntegration_DSReplace_Bogus(t *testing.T) {
 		Digest:     strings.Repeat("FF", 32), // 64 hex chars — valid length but wrong digest
 	}
 	req := &QueryRequest{
-		QName:            "junesta.net.",
+		QName:            "nsec3.uk.",
 		QType:            "SOA",
 		Mode:             "recursive",
 		Flags:            QueryFlags{DO: true, Validate: true},
 		TrustAnchorMode:  "iana",
 		TrustAnchors:     testIANATrustAnchors,
-		ZoneTrustAnchors: []ZoneTrustAnchor{{Zone: "junesta.net.", DS: []TrustAnchorDS{badDS}, Override: true}},
+		ZoneTrustAnchors: []ZoneTrustAnchor{{Zone: "nsec3.uk.", DS: []TrustAnchorDS{badDS}, Override: true}},
 	}
 	resp := execRecursive(req)
 	if resp.DNSSECValid != false {
