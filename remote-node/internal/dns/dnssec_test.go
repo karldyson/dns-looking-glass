@@ -1532,3 +1532,47 @@ func TestIntegration_DSReplace_Bogus(t *testing.T) {
 		t.Errorf("DSReplace_Bogus: DNSSECValid = %v, want false (wrong caller DS should yield BOGUS)", resp.DNSSECValid)
 	}
 }
+
+// TestIntegration_DSUnsignedZone verifies that supplying a caller DS for a zone
+// that has no DNSKEY records (unsigned zone) yields BOGUS, not indeterminate.
+// The DS promises a key that doesn't exist in the zone — a cryptographic failure.
+func TestIntegration_DSUnsignedZone(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping network integration tests (-short)")
+	}
+
+	// Confirm baseline is "insecure" — unsigned zone, no DS in parent.
+	baseline := runRecursiveValidate(t, "unsigned.nsec3.uk.", "SOA")
+	if baseline.DNSSECValid != "insecure" {
+		t.Skipf("baseline not insecure (got %v) — zone may have been signed; skipping", baseline.DNSSECValid)
+	}
+
+	// Supply a syntactically valid but non-matching DS. The zone has no DNSKEYs,
+	// so no key can ever match — the DS claim cannot be satisfied → BOGUS.
+	fakeDS := TrustAnchorDS{
+		KeyTag:     12345,
+		Algorithm:  13,
+		DigestType: 2,
+		Digest:     strings.Repeat("AB", 32), // valid SHA-256 length, wrong value
+	}
+	req := &QueryRequest{
+		QName:            "unsigned.nsec3.uk.",
+		QType:            "SOA",
+		Mode:             "recursive",
+		Flags:            QueryFlags{DO: true, Validate: true},
+		TrustAnchorMode:  "iana",
+		TrustAnchors:     testIANATrustAnchors,
+		ZoneTrustAnchors: []ZoneTrustAnchor{{Zone: "unsigned.nsec3.uk.", DS: []TrustAnchorDS{fakeDS}}},
+	}
+	resp := execRecursive(req)
+	if resp.DNSSECValid != false {
+		var notes []string
+		for _, s := range resp.ResolutionChain {
+			if s.StepNote != "" {
+				notes = append(notes, fmt.Sprintf("  [%s %s @ %s] %s", s.QType, s.QName, s.Nameserver, s.StepNote))
+			}
+		}
+		t.Errorf("unsigned.nsec3.uk. SOA with fake DS: DNSSECValid = %v, want false (no DNSKEY to match DS → BOGUS)\n%s",
+			resp.DNSSECValid, strings.Join(notes, "\n"))
+	}
+}

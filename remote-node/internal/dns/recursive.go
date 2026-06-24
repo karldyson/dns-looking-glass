@@ -458,10 +458,12 @@ func validateChainOfTrust(chain []ResolutionStep, req *QueryRequest) (interface{
 		if len(keys) == 0 {
 			if len(level.ds) > 0 {
 				// Parent signed a DS for this zone but the zone has no DNSKEY — BOGUS.
+				dbg("validate: no DNSKEY for %s but parent DS exists → BOGUS", level.zone)
 				step.StepNote += " — no DNSKEY records but parent DS exists (BOGUS)"
 				extraSteps = append(extraSteps, step)
 				return false, extraSteps
 			}
+			dbg("validate: no DNSKEY for %s (no DS either) → indeterminate", level.zone)
 			step.StepNote += " — no DNSKEY records returned (indeterminate)"
 			extraSteps = append(extraSteps, step)
 			return "indeterminate", extraSteps
@@ -585,6 +587,7 @@ func validateChainOfTrust(chain []ResolutionStep, req *QueryRequest) (interface{
 					intKeys, intSteps, intOK, _ := validateIntermediateZones(level.zone, signer, level.ns, keys, nsidRequested)
 					extraSteps = append(extraSteps, intSteps...)
 					if !intOK {
+						dbg("validate: intermediate zone %s failed → BOGUS", signer)
 						step.StepNote += fmt.Sprintf(", intermediate zone %s validation failed (BOGUS)", signer)
 						extraSteps = append(extraSteps, step)
 						return false, extraSteps
@@ -890,6 +893,7 @@ func validateChainOfTrust(chain []ResolutionStep, req *QueryRequest) (interface{
 				selfSteps, _ := attemptSelfVerification(signerZone, last, nsidRequested)
 				return "insecure", append(extraSteps, selfSteps...)
 			} else {
+				dbg("validate: DS response for %s has unexpected rcode %d → indeterminate", signerZone, dsResp.Rcode)
 				return "indeterminate", extraSteps
 			}
 		} else if entry, ok := callerDSMap[signerZoneNorm]; ok && !entry.replace {
@@ -924,6 +928,7 @@ func validateChainOfTrust(chain []ResolutionStep, req *QueryRequest) (interface{
 							selfSteps, _ := attemptSelfVerification(signerZone, last, nsidRequested)
 							return "insecure", append(extraSteps, selfSteps...)
 						}
+						dbg("validate: intermediate zone %s failed → BOGUS", dsSigner)
 						extraSteps[dsStepIdx].StepNote += fmt.Sprintf(" — intermediate zone %s validation failed (BOGUS)", dsSigner)
 						return false, extraSteps
 					}
@@ -983,6 +988,7 @@ func validateChainOfTrust(chain []ResolutionStep, req *QueryRequest) (interface{
 					return false, extraSteps
 				} else {
 					// Intermediate zones are signed but DS for signerZone has no RRSIG — bogus.
+					dbg("validate: DS for %s has no RRSIG despite signed intermediate zone %s → BOGUS", signerZone, signerParent)
 					dsStep.StepNote += " — DS has no RRSIG despite signed parent zone (BOGUS)"
 					extraSteps = append(extraSteps, dsStep)
 					return false, extraSteps
@@ -991,6 +997,7 @@ func validateChainOfTrust(chain []ResolutionStep, req *QueryRequest) (interface{
 				// parentOfSigner == last.zone: last.zone is a validated signed zone, so its
 				// DS for signerZone should be RRSIG-signed. No RRSIG is bogus regardless of
 				// whether a caller-supplied DS override was provided.
+				dbg("validate: DS for %s has no RRSIG from signed parent zone %s → BOGUS", signerZone, last.zone)
 				extraSteps[dsStepIdx].StepNote += " — DS has no RRSIG from signed parent zone (BOGUS)"
 				return false, extraSteps
 			}
@@ -1022,9 +1029,20 @@ func validateChainOfTrust(chain []ResolutionStep, req *QueryRequest) (interface{
 		childKeys := extractDNSKEYs(childKeyResp)
 		dbg("validate: got %d DNSKEY(s) for child zone %s", len(childKeys), signerZone)
 		if len(childKeys) == 0 {
-			childKeyStep.StepNote += " — no DNSKEY returned (indeterminate)"
+			// A DS exists (parent-published or caller-supplied) but the zone has no
+			// DNSKEY records — the DS asserts a key that doesn't exist.
+			// If the parent chain is already insecure, insecure takes precedence
+			// (RFC 4033 §5); otherwise this is a cryptographic failure → BOGUS.
+			if signerParentInsecure {
+				dbg("validate: no DNSKEY for child zone %s; parent chain insecure → insecure", signerZone)
+				childKeyStep.StepNote += " — no DNSKEY records returned; parent chain is insecure (RFC 4033 §5)"
+				extraSteps = append(extraSteps, childKeyStep)
+				return "insecure", extraSteps
+			}
+			dbg("validate: no DNSKEY for child zone %s but DS exists → BOGUS", signerZone)
+			childKeyStep.StepNote += " — no DNSKEY records but DS exists (BOGUS)"
 			extraSteps = append(extraSteps, childKeyStep)
-			return "indeterminate", extraSteps
+			return false, extraSteps
 		}
 		if ok, matchTags := anyKeyMatchesDS(childKeys, dsForChildMatch); !ok {
 			dbg("validate: child DNSKEY does not match DS for %s → BOGUS", signerZone)
@@ -1330,14 +1348,18 @@ func convertZoneDS(zone string, anchors []TrustAnchorDS) []*dns.DS {
 // show whether a zone is self-consistently signed before DS is published.
 // Returns extra steps and a human-readable note.
 func attemptSelfVerification(zone string, last zoneLevel, nsidRequested bool) ([]ResolutionStep, string) {
+	dbg("validate: attemptSelfVerification for %s", zone)
 	keyResp, keyStep := fetchDNSKEYResponse(zone, last.ns, nsidRequested)
 	keyStep.StepNote = fmt.Sprintf("Self-verification: fetching %s DNSKEY (no parent DS — not a chain-of-trust check)", zone)
 	if keyResp == nil {
+		dbg("validate: self-verify %s: DNSKEY fetch failed", zone)
 		keyStep.StepNote += " — fetch failed"
 		return []ResolutionStep{keyStep}, "DNSKEY fetch failed — cannot self-verify"
 	}
 	keys := extractDNSKEYs(keyResp)
+	dbg("validate: self-verify %s: got %d DNSKEY(s)", zone, len(keys))
 	if len(keys) == 0 {
+		dbg("validate: self-verify %s: no DNSKEY records", zone)
 		keyStep.StepNote += " — no DNSKEY records returned"
 		return []ResolutionStep{keyStep}, "no DNSKEY records — cannot self-verify"
 	}
@@ -1373,12 +1395,15 @@ func attemptSelfVerification(zone string, last zoneLevel, nsidRequested bool) ([
 		}
 		if !selfSigOK {
 			if selfSigExpiredOnly {
+				dbg("validate: self-verify %s: DNSKEY self-sig expired (crypto OK)", zone)
 				keyStep.StepNote += " — DNSKEY self-sig cryptographically OK but RRSIG expired (zone needs re-signing)"
 				return []ResolutionStep{keyStep}, "DNSKEY self-sig expired (crypto OK — zone needs re-signing)"
 			}
+			dbg("validate: self-verify %s: DNSKEY self-sig FAILED", zone)
 			keyStep.StepNote += " — DNSKEY self-sig FAILED (signing error)"
 			return []ResolutionStep{keyStep}, "DNSKEY self-sig failed (zone signing error?)"
 		}
+		dbg("validate: self-verify %s: DNSKEY self-sig OK", zone)
 	}
 
 	allRRs := append(last.resp.Answer, last.resp.Ns...)
@@ -1420,12 +1445,15 @@ func attemptSelfVerification(zone string, last zoneLevel, nsidRequested bool) ([
 			failed = append(failed, label)
 		}
 	}
+	dbg("validate: self-verify %s: verified=%d expired=%d failed=%d", zone, len(verified), len(expired), len(failed))
 
 	if len(verified) == 0 && len(expired) == 0 && len(failed) == 0 {
+		dbg("validate: self-verify %s: no RRSIGs to verify", zone)
 		keyStep.StepNote += " — no RRSIGs in final response to verify"
 		return []ResolutionStep{keyStep}, "no RRSIGs to verify (zone may not be signing)"
 	}
 	if len(failed) > 0 {
+		dbg("validate: self-verify %s: FAILED for %v", zone, failed)
 		parts := failed
 		if len(expired) > 0 {
 			parts = append(parts, expired...)
@@ -1434,6 +1462,7 @@ func attemptSelfVerification(zone string, last zoneLevel, nsidRequested bool) ([
 		return []ResolutionStep{keyStep}, fmt.Sprintf("self-verification failed for %s (zone signing error?)", strings.Join(failed, ", "))
 	}
 	if len(expired) > 0 && len(verified) == 0 {
+		dbg("validate: self-verify %s: all RRSIGs expired (crypto OK)", zone)
 		keyStep.StepNote += fmt.Sprintf(" — RRSIG(s) expired (crypto OK): %s (zone needs re-signing)", strings.Join(expired, ", "))
 		return []ResolutionStep{keyStep}, fmt.Sprintf("self-verified crypto OK but RRSIG(s) expired: %s — zone needs re-signing", strings.Join(expired, ", "))
 	}
@@ -1441,6 +1470,7 @@ func attemptSelfVerification(zone string, last zoneLevel, nsidRequested bool) ([
 	if len(expired) > 0 {
 		note += fmt.Sprintf("; expired (crypto OK): %s", strings.Join(expired, ", "))
 	}
+	dbg("validate: self-verify %s: OK — %s", zone, note)
 	keyStep.StepNote += fmt.Sprintf(" — self-verified: %s (signatures correct, but no parent DS — insecure)", note)
 	return []ResolutionStep{keyStep}, fmt.Sprintf("self-verified %s OK (signatures correct, no parent DS)", note)
 }
@@ -1625,16 +1655,19 @@ func validateIntermediateZones(parentZone, signerZone string, ns namedAddr, pare
 		}
 		z = dns.Fqdn(strings.Join(labels[1:], "."))
 	}
+	dbg("validate: validateIntermediateZones %s→%s: %d zone(s) to traverse", parentZone, signerZone, len(zones))
 
 	var extraSteps []ResolutionStep
 	currentKeys := parentKeys
 
 	for _, zone := range zones {
+		dbg("validate: intermediate zone %s: fetching DS", zone)
 		dsResp, dsStep := fetchDSResponse(zone, ns, nsidRequested)
 		dsStep.StepNote = fmt.Sprintf("Fetching DS for intermediate zone %s (zone boundary inferred from RRSIG signer)", zone)
 		extraSteps = append(extraSteps, dsStep)
 
 		if dsResp == nil {
+			dbg("validate: intermediate zone %s: DS fetch failed → indeterminate", zone)
 			dsStep.StepNote += " — fetch failed"
 			return nil, extraSteps, false, false
 		}
@@ -1645,55 +1678,71 @@ func validateIntermediateZones(parentZone, signerZone string, ns namedAddr, pare
 				ds = append(ds, d)
 			}
 		}
+		dbg("validate: intermediate zone %s: got %d DS record(s)", zone, len(ds))
 		if len(ds) == 0 {
+			dbg("validate: intermediate zone %s: no DS → insecure", zone)
 			dsStep.StepNote += " — no DS records found; unsigned delegation (insecure)"
 			return nil, extraSteps, false, true
 		}
 		if ok, dsSigTag := verifyDSRRSigInAnswer(dsResp.Answer, currentKeys); !ok {
+			dbg("validate: intermediate zone %s: DS RRSIG failed → BOGUS", zone)
 			dsStep.StepNote += " — DS RRSIG failed (BOGUS)"
 			return nil, extraSteps, false, false
 		} else if dsSigTag != 0 {
+			dbg("validate: intermediate zone %s: DS RRSIG OK (keytag=%d)", zone, dsSigTag)
 			dsStep.StepNote += fmt.Sprintf(" — DS sig OK (keytag=%d)", dsSigTag)
 		} else {
+			dbg("validate: intermediate zone %s: DS RRSIG OK", zone)
 			dsStep.StepNote += " — DS sig OK"
 		}
 
+		dbg("validate: intermediate zone %s: fetching DNSKEY", zone)
 		keyResp, keyStep := fetchDNSKEYResponse(zone, ns, nsidRequested)
 		keyStep.StepNote = fmt.Sprintf("Validating intermediate zone %s DNSKEY", zone)
 		extraSteps = append(extraSteps, keyStep)
 
 		if keyResp == nil {
+			dbg("validate: intermediate zone %s: DNSKEY fetch failed → indeterminate", zone)
 			keyStep.StepNote += " — fetch failed"
 			return nil, extraSteps, false, false
 		}
 		keys := extractDNSKEYs(keyResp)
+		dbg("validate: intermediate zone %s: got %d DNSKEY(s)", zone, len(keys))
 		if len(keys) == 0 {
+			dbg("validate: intermediate zone %s: no DNSKEY but DS exists → BOGUS", zone)
 			keyStep.StepNote += " — no DNSKEY records"
 			return nil, extraSteps, false, false
 		}
 		if ok, matchTags := anyKeyMatchesDS(keys, ds); !ok {
+			dbg("validate: intermediate zone %s: DNSKEY does not match DS → BOGUS", zone)
 			keyStep.StepNote += " — DNSKEY does not match DS (BOGUS)"
 			return nil, extraSteps, false, false
 		} else {
+			dbg("validate: intermediate zone %s: DS match OK, %s", zone, formatKeyTags(matchTags))
 			keyStep.StepNote += fmt.Sprintf(" — DS match OK, %s", formatKeyTags(matchTags))
 		}
 		if err, sigTag := verifyDNSKEYRRSig(keys, keyResp); err != nil {
 			if err == dns.ErrAlg {
 				// RFC 4033 §5: unsupported algorithm → treat as if unsigned (insecure).
+				dbg("validate: intermediate zone %s: DNSKEY self-sig uses unsupported alg → insecure (RFC 4033 §5)", zone)
 				keyStep.StepNote += fmt.Sprintf(", DNSKEY self-signature uses unsupported algorithm %s — insecure (RFC 4033 §5)", dnsKeyAlgName(keys))
 				extraSteps = append(extraSteps, keyStep)
 				return nil, extraSteps, false, true // isInsecure=true: treat as unsigned per RFC 4033 §5
 			}
+			dbg("validate: intermediate zone %s: DNSKEY self-sig failed → BOGUS", zone)
 			keyStep.StepNote += ", DNSKEY self-signature failed (BOGUS)"
 			return nil, extraSteps, false, false
 		} else if sigTag != 0 {
+			dbg("validate: intermediate zone %s: DNSKEY self-sig OK (keytag=%d)", zone, sigTag)
 			keyStep.StepNote += fmt.Sprintf(", self-sig OK (keytag=%d)", sigTag)
 		} else {
+			dbg("validate: intermediate zone %s: DNSKEY self-sig OK", zone)
 			keyStep.StepNote += ", self-sig OK"
 		}
 		currentKeys = keys
 	}
 
+	dbg("validate: validateIntermediateZones %s→%s: all OK, returning %d key(s)", parentZone, signerZone, len(currentKeys))
 	return currentKeys, extraSteps, true, false
 }
 
