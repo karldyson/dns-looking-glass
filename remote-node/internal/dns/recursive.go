@@ -90,9 +90,13 @@ func execRecursive(req *QueryRequest) *QueryResponse {
 		msg.AuthenticatedData = req.Flags.AD
 		msg.CheckingDisabled = req.Flags.CD
 
-		if req.Flags.DO || len(reqEdnsOpts) > 0 {
+		if req.Flags.DO || req.EDNS.UDPSize > 0 || len(reqEdnsOpts) > 0 {
+			udpSize := req.EDNS.UDPSize
+			if udpSize == 0 {
+				udpSize = 1232
+			}
 			o := &dns.OPT{Hdr: dns.RR_Header{Name: ".", Rrtype: dns.TypeOPT}}
-			o.SetUDPSize(1232)
+			o.SetUDPSize(udpSize)
 			if req.Flags.DO {
 				o.SetDo()
 			}

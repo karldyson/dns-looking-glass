@@ -190,18 +190,45 @@ const DNSParser = (() => {
     r.seek(rdstart + rdlen);
     const end = r.mark();
 
-    const children = [
-      { start, end: rdstart - 10, field: 'Name',  value: name },
-      { start: rdstart - 10, end: rdstart - 8, field: 'Type',  value: typeStr(type) },
-      { start: rdstart - 8,  end: rdstart - 6, field: 'Class', value: classStr(cls) },
-      { start: rdstart - 6,  end: rdstart - 2, field: 'TTL',   value: `${ttl}s` },
-      { start: rdstart - 2,  end: rdstart,     field: 'RDLENGTH', value: rdlen },
-      ...rdata,
-    ];
+    let children;
+    if (type === 41) {
+      // OPT RR: Class = UDP payload size; TTL = extended RCODE (8b) | version (8b) | Z+DO (16b)
+      const udpSize  = cls;
+      const extRcode = (ttl >>> 24) & 0xFF;
+      const ednsVer  = (ttl >>> 16) & 0xFF;
+      const doBit    = (ttl >>> 15) & 1;
+      children = [
+        { start, end: rdstart - 10, field: 'Name', value: name },
+        { start: rdstart - 10, end: rdstart - 8, field: 'Type', value: 'OPT' },
+        { start: rdstart - 8,  end: rdstart - 6, field: 'UDP Payload Size', value: udpSize },
+        {
+          label: `Extended RCODE and Flags: 0x${ttl.toString(16).padStart(8, '0')}`,
+          start: rdstart - 6, end: rdstart - 2,
+          children: [
+            { start: rdstart - 6, end: rdstart - 5, field: 'Extended RCODE', value: extRcode },
+            { start: rdstart - 5, end: rdstart - 4, field: 'EDNS Version',   value: ednsVer },
+            { start: rdstart - 4, end: rdstart - 2,
+              bits:  doBit ? '1... .... .... ....' : '0... .... .... ....',
+              field: 'DO', desc: doBit ? 'DNSSEC OK' : 'DNSSEC not OK' },
+          ],
+        },
+        { start: rdstart - 2, end: rdstart, field: 'RDLENGTH', value: rdlen },
+        ...rdata,
+      ];
+    } else {
+      children = [
+        { start, end: rdstart - 10, field: 'Name',  value: name },
+        { start: rdstart - 10, end: rdstart - 8, field: 'Type',  value: typeStr(type) },
+        { start: rdstart - 8,  end: rdstart - 6, field: 'Class', value: classStr(cls) },
+        { start: rdstart - 6,  end: rdstart - 2, field: 'TTL',   value: `${ttl}s` },
+        { start: rdstart - 2,  end: rdstart,     field: 'RDLENGTH', value: rdlen },
+        ...rdata,
+      ];
+    }
 
     ann.push({ start, end, field: typeStr(type), value: name });
 
-    return { start, end, label: `${name} ${typeStr(type)}`, children };
+    return { start, end, label: type === 41 ? 'OPT (EDNS)' : `${name} ${typeStr(type)}`, children };
   }
 
   // ── RDATA parsers ───────────────────────────────────────────────────────────
@@ -356,11 +383,11 @@ const DNSParser = (() => {
         const rows = [];
         const endPos = start + rdlen;
         while (r.mark() < endPos) {
-          const optCode = r.u16();
-          const optLen  = r.u16();
-          const optData = r.bytes(optLen);
-          const optStart = r.mark() - optLen - 4;
-          rows.push({ start: optStart, end: r.mark(), field: optCodeStr(optCode), value: bytesHex(optData) });
+          const optStart = r.mark();
+          const optCode  = r.u16();
+          const optLen   = r.u16();
+          const optData  = r.bytes(optLen);
+          rows.push(decodeEdnsOpt(optCode, optData, optStart, r.mark()));
         }
         return rows;
       }
@@ -419,7 +446,45 @@ const DNSParser = (() => {
     return m[a] ?? `ALG${a}`;
   }
   function digestTypeStr(d) { return { 1:'SHA-1', 2:'SHA-256', 3:'GOST-94', 4:'SHA-384' }[d] ?? `DTYPE${d}`; }
-  function optCodeStr(c)    { return { 3:'NSID', 8:'ECS', 10:'COOKIE', 11:'TCP-KEEPALIVE', 12:'PADDING' }[c] ?? `OPT${c}`; }
+  function optCodeStr(c)    { return { 3:'NSID', 8:'ECS', 10:'COOKIE', 11:'TCP-KEEPALIVE', 12:'PADDING', 19:'ZONEVERSION' }[c] ?? `OPT${c}`; }
+
+  function decodeEdnsOpt(code, data, start, end) {
+    const name = optCodeStr(code);
+    switch (code) {
+      case 3: { // NSID
+        const hex = bytesHex(data);
+        const txt = Array.from(data).map(b => b >= 0x20 && b < 0x7f ? String.fromCharCode(b) : '.').join('');
+        return { start, end, field: name, value: data.length ? `${hex} (${txt})` : '(request)' };
+      }
+      case 8: { // ECS
+        if (data.length < 4) break;
+        const family  = (data[0] << 8) | data[1];
+        const srcPfx  = data[2];
+        const scpPfx  = data[3];
+        const addrBytes = data.slice(4);
+        const familyStr = family === 1 ? 'IPv4' : family === 2 ? 'IPv6' : `AF${family}`;
+        const addrHex   = addrBytes.length ? bytesHex(addrBytes) : '0';
+        return { start, end, field: name, value: `${familyStr}/${srcPfx} scope=${scpPfx} addr=${addrHex}` };
+      }
+      case 19: { // ZONEVERSION
+        if (data.length < 2) break;
+        const labelCount = data[0];
+        const zvType     = data[1];
+        const version    = data.slice(2);
+        const typeName   = zvType === 0 ? 'SOA-SERIAL' : zvType >= 246 ? 'private-use' : `type ${zvType}`;
+        let verStr = '';
+        if (version.length === 4) {
+          const val = ((version[0] << 24) | (version[1] << 16) | (version[2] << 8) | version[3]) >>> 0;
+          verStr = zvType === 0 ? ` serial=${val}` : ` value=${val} (0x${bytesHex(version)})`;
+        } else if (version.length) {
+          verStr = ` version=${bytesHex(version)}`;
+        }
+        return { start, end, field: name, value: `labels=${labelCount} ${typeName}${verStr}` };
+      }
+      default: break;
+    }
+    return { start, end, field: name, value: data.length ? bytesHex(data) : '(empty)' };
+  }
   function bytesHex(b)      { return [...b].map(x => x.toString(16).padStart(2,'0')).join(''); }
   function tsStr(epoch) {
     try { return new Date(epoch * 1000).toISOString().replace('T',' ').replace('.000Z',' UTC'); }

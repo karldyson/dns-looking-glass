@@ -165,16 +165,19 @@ function wireFormBehaviours() {
     radio.addEventListener('change', onModeChange);
   });
 
-  // EDNS size toggle.
+  // EDNS size toggle — only fires when the checkbox is interactive (not locked by syncEdnsUDPSize).
   document.getElementById('edns-size-enable').addEventListener('change', function () {
     document.getElementById('edns-size-fields').classList.toggle('hidden', !this.checked);
   });
 
-  // NSID has no sub-fields.
+  // NSID, ZONEVERSION — sync UDP size lock whenever these toggle.
+  document.getElementById('edns-nsid').addEventListener('change', syncEdnsUDPSize);
+  document.getElementById('edns-zoneversion').addEventListener('change', syncEdnsUDPSize);
 
-  // ECS toggle.
+  // ECS toggle — show/hide sub-fields and sync UDP size lock.
   document.getElementById('edns-ecs-enable').addEventListener('change', function () {
     document.getElementById('edns-ecs-fields').classList.toggle('hidden', !this.checked);
+    syncEdnsUDPSize();
   });
 
   // ECS family change — update source prefix default.
@@ -183,12 +186,9 @@ function wireFormBehaviours() {
     src.value = this.value === '2' ? '48' : '24';
   });
 
-  // DO flag — auto-enable EDNS when DO is checked; keep Validate in sync.
+  // DO flag — sync UDP size lock and keep Validate in sync.
   document.getElementById('flag-do').addEventListener('change', function () {
-    if (this.checked) {
-      document.getElementById('edns-size-enable').checked = true;
-      document.getElementById('edns-size-fields').classList.remove('hidden');
-    }
+    syncEdnsUDPSize();
     updateValidateState();
   });
 
@@ -274,19 +274,46 @@ function updateValidateState() {
   anchorFields.classList.toggle('hidden', !validateChecked);
 }
 
-function onProtocolChange() {
+// RFC 6891 §6.1.2: the OPT RR (required for any EDNS option or the DO bit) always
+// carries the UDP payload size field — you cannot send EDNS options without it.
+// This function locks the UDP-size checkbox on whenever any EDNS feature is active,
+// preventing the inconsistent state where options are enabled but the size appears off.
+function syncEdnsUDPSize() {
   const isTCP = document.querySelector('input[name="use_tcp"]:checked')?.value === 'tcp';
+  if (isTCP) return; // TCP mode is handled entirely by onProtocolChange.
+
+  const ednsActive =
+    document.getElementById('flag-do').checked ||
+    document.getElementById('edns-nsid').checked ||
+    document.getElementById('edns-zoneversion').checked ||
+    document.getElementById('edns-ecs-enable').checked;
+
   const sizeCheck = document.getElementById('edns-size-enable');
   const sizeLabel = sizeCheck.closest('.check-label');
-  const sizeFields = document.getElementById('edns-size-fields');
-  if (isTCP) {
+
+  if (ednsActive) {
+    sizeCheck.checked = true;
+    document.getElementById('edns-size-fields').classList.remove('hidden');
     sizeLabel.classList.add('disabled');
     sizeLabel.setAttribute('aria-disabled', 'true');
-    sizeFields.classList.add('hidden');
+    sizeLabel.title = 'EDNS OPT record is required when EDNS options are active';
   } else {
     sizeLabel.classList.remove('disabled');
     sizeLabel.removeAttribute('aria-disabled');
-    if (sizeCheck.checked) sizeFields.classList.remove('hidden');
+    sizeLabel.title = '';
+    document.getElementById('edns-size-fields').classList.toggle('hidden', !sizeCheck.checked);
+  }
+}
+
+function onProtocolChange() {
+  const isTCP = document.querySelector('input[name="use_tcp"]:checked')?.value === 'tcp';
+  const sizeLabel = document.getElementById('edns-size-enable').closest('.check-label');
+  if (isTCP) {
+    sizeLabel.classList.add('disabled');
+    sizeLabel.setAttribute('aria-disabled', 'true');
+    document.getElementById('edns-size-fields').classList.add('hidden');
+  } else {
+    syncEdnsUDPSize();
   }
 }
 
