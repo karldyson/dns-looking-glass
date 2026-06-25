@@ -105,7 +105,7 @@ func execDirect(req *QueryRequest) *QueryResponse {
 		ResolutionChain:  []ResolutionStep{},
 	}
 
-	// Extract NSID and any other registered EDNS options from response.
+	// Extract NSID, ZONEVERSION, and any other registered EDNS options from response.
 	for _, extra := range resp.Extra {
 		if opt, ok := extra.(*dns.OPT); ok {
 			parsed := edns.ParseAll(opt)
@@ -119,7 +119,13 @@ func execDirect(req *QueryRequest) *QueryResponse {
 					}
 				}
 			}
+			if zvData, ok := parsed[dns.EDNS0ZONEVERSION]; ok {
+				qr.ZoneVersion = zvData
+			}
 		}
+	}
+	if qr.ZoneVersion != nil {
+		qr.ResponseText = cleanZoneVersionText(qr.ResponseText, qr.ZoneVersion)
 	}
 
 	return qr

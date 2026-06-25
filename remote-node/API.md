@@ -132,6 +132,26 @@ Sends a client subnet prefix to the nameserver for geolocation-aware responses.
 {"code": 8, "family": 1, "address": "203.0.113.0", "source_prefix": 24}
 ```
 
+#### EDNS option: ZONEVERSION (code 19)
+
+Requests zone version information from the nameserver (RFC 9660). No additional fields — the request carries an empty OPTION-DATA; the server fills in the version data in its response.
+
+```json
+{"code": 19}
+```
+
+The response data appears in `response_text` as `; ZONEVERSION: …` lines in the OPT section. The EDNS-parsed data for option code 19 (available to callers who process the raw Go node response) contains:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `label_count` | int | Number of labels in the zone name the version refers to. |
+| `type` | int | Version type code: `0` = SOA-SERIAL, 1–245 = unassigned, 246–255 = private use. |
+| `type_name` | string | Human-readable type name: `"SOA-SERIAL"`, `"unassigned"`, or `"private-use"`. |
+| `serial` | int | SOA serial number (type 0 only, present when the VERSION field is exactly 4 bytes). |
+| `version_hex` | string | Raw VERSION data as lowercase hex (unknown/private types only). |
+
+When a server returns multiple ZONEVERSION options (one per zone level on the delegation path), only the last one is captured in the parsed EDNS data; all values are visible in `response_text`. Only type 0 (SOA-SERIAL, RFC 9660) is currently defined; additional type codes are being specified in a forthcoming internet draft and will be returned as `"unassigned"` with `version_hex` until support is added.
+
 ### `trust_anchors`
 
 Array of DS records representing the IANA root trust anchors. Used when `trust_anchor_mode == "iana"`. The web server fetches and caches these from IANA; supply them here when calling the node directly.

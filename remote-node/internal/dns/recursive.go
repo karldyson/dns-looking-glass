@@ -56,7 +56,12 @@ func execRecursive(req *QueryRequest) *QueryResponse {
 	var chain []ResolutionStep
 	var dnssecValid interface{} = nil
 
-	// Detect user-requested NSID once so we can include it in every iterative query.
+	// Pre-build all user-requested EDNS options (NSID, ZONEVERSION, etc.) so they
+	// are included in every iterative query.  Build errors are surfaced early.
+	reqEdnsOpts, err := edns.Build(req.EDNS.Options)
+	if err != nil {
+		return &QueryResponse{Error: fmt.Sprintf("edns: %v", err)}
+	}
 	nsidRequested := false
 	for _, opt := range req.EDNS.Options {
 		if code, ok := opt["code"].(float64); ok && uint16(code) == dns.EDNS0NSID {
@@ -85,15 +90,13 @@ func execRecursive(req *QueryRequest) *QueryResponse {
 		msg.AuthenticatedData = req.Flags.AD
 		msg.CheckingDisabled = req.Flags.CD
 
-		if req.Flags.DO || nsidRequested {
+		if req.Flags.DO || len(reqEdnsOpts) > 0 {
 			o := &dns.OPT{Hdr: dns.RR_Header{Name: ".", Rrtype: dns.TypeOPT}}
 			o.SetUDPSize(1232)
 			if req.Flags.DO {
 				o.SetDo()
 			}
-			if nsidRequested {
-				o.Option = append(o.Option, &dns.EDNS0_NSID{Code: dns.EDNS0NSID})
-			}
+			o.Option = append(o.Option, reqEdnsOpts...)
 			msg.Extra = append(msg.Extra, o)
 		}
 
@@ -132,6 +135,10 @@ func execRecursive(req *QueryRequest) *QueryResponse {
 		stepEntry.DNSQueryMS = elapsed
 		if nsidRequested {
 			stepEntry.NSID = extractNSIDFromMsg(resp)
+		}
+		if len(reqEdnsOpts) > 0 {
+			stepEntry.ZoneVersion = extractZoneVersionFromMsg(resp)
+			stepEntry.ResponseText = cleanZoneVersionText(stepEntry.ResponseText, stepEntry.ZoneVersion)
 		}
 		chain = append(chain, stepEntry)
 
@@ -244,6 +251,7 @@ func execRecursive(req *QueryRequest) *QueryResponse {
 
 func buildRecursiveResponse(chain []ResolutionStep, dnssecValid interface{}) *QueryResponse {
 	var lastResponse, lastNS, lastNSID string
+	var lastZV map[string]interface{}
 	var totalMS float64
 	// Use the last resolution step (not a validation step) for the top-level response,
 	// so the "answer" box always shows the DNS answer regardless of whether validation ran.
@@ -252,6 +260,7 @@ func buildRecursiveResponse(chain []ResolutionStep, dnssecValid interface{}) *Qu
 			lastResponse = chain[i].ResponseText
 			lastNS = chain[i].Nameserver
 			lastNSID = chain[i].NSID
+			lastZV = chain[i].ZoneVersion
 			break
 		}
 	}
@@ -262,6 +271,7 @@ func buildRecursiveResponse(chain []ResolutionStep, dnssecValid interface{}) *Qu
 		Nameserver:      lastNS,
 		ResponseText:    lastResponse,
 		NSID:            lastNSID,
+		ZoneVersion:     lastZV,
 		DNSQueryMS:      totalMS,
 		DNSSECValid:     dnssecValid,
 		ResolutionChain: chain,
@@ -378,6 +388,7 @@ func validateChainOfTrust(chain []ResolutionStep, req *QueryRequest) (interface{
 		return "indeterminate", nil
 	}
 
+	reqEdnsOpts, _ := edns.Build(req.EDNS.Options) // error already checked in execRecursive
 	nsidRequested := false
 	for _, opt := range req.EDNS.Options {
 		if code, ok := opt["code"].(float64); ok && uint16(code) == dns.EDNS0NSID {
@@ -443,7 +454,7 @@ func validateChainOfTrust(chain []ResolutionStep, req *QueryRequest) (interface{
 			return "insecure", extraSteps
 		}
 
-		keyResp, step := fetchDNSKEYResponse(level.zone, level.ns, nsidRequested)
+		keyResp, step := fetchDNSKEYResponse(level.zone, level.ns, nsidRequested, reqEdnsOpts)
 		step.StepNote = fmt.Sprintf("Validating %s DNSKEY", level.zone)
 
 		if keyResp == nil {
@@ -584,7 +595,7 @@ func validateChainOfTrust(chain []ResolutionStep, req *QueryRequest) (interface{
 					// chain (e.g. uk. and co.uk. share nameservers so the uk. server returns
 					// the junesta.co.uk. DS signed by co.uk.'s ZSK directly).
 					dbg("validate: DS signer %q ≠ current zone %q — interpolating intermediate zone(s)", signer, level.zone)
-					intKeys, intSteps, intOK, _ := validateIntermediateZones(level.zone, signer, level.ns, keys, nsidRequested)
+					intKeys, intSteps, intOK, _ := validateIntermediateZones(level.zone, signer, level.ns, keys, nsidRequested, reqEdnsOpts)
 					extraSteps = append(extraSteps, intSteps...)
 					if !intOK {
 						dbg("validate: intermediate zone %s failed → BOGUS", signer)
@@ -718,7 +729,7 @@ func validateChainOfTrust(chain []ResolutionStep, req *QueryRequest) (interface{
 
 	if signerZone != last.zone {
 		dbg("validate: signer zone differs — fetching DS for %s from parent server %s", signerZone, last.ns.addr)
-		dsResp, dsStep := fetchDSResponse(signerZone, last.ns, nsidRequested)
+		dsResp, dsStep := fetchDSResponse(signerZone, last.ns, nsidRequested, reqEdnsOpts)
 		dsStep.StepNote = fmt.Sprintf("Fetching DS for %s (zone boundary not seen in referrals)", signerZone)
 		extraSteps = append(extraSteps, dsStep)
 		dsStepIdx := len(extraSteps) - 1
@@ -825,7 +836,7 @@ func validateChainOfTrust(chain []ResolutionStep, req *QueryRequest) (interface{
 							dbg("validate: denial RRSIG SignerName %q ≠ last.zone %q — validating intermediate zone", denialSigner, last.zone)
 							dsStepHeld := extraSteps[dsStepIdx]
 							extraSteps = extraSteps[:dsStepIdx]
-							intKeys, intSteps, intOK, intInsecure := validateIntermediateZones(last.zone, denialSigner, last.ns, keys, nsidRequested)
+							intKeys, intSteps, intOK, intInsecure := validateIntermediateZones(last.zone, denialSigner, last.ns, keys, nsidRequested, reqEdnsOpts)
 							extraSteps = append(extraSteps, intSteps...)
 							extraSteps = append(extraSteps, dsStepHeld)
 							dsStepIdx = len(extraSteps) - 1
@@ -890,7 +901,7 @@ func validateChainOfTrust(chain []ResolutionStep, req *QueryRequest) (interface{
 				}
 				dbg("validate: NOERROR but no DS for %s → insecure", signerZone)
 				extraSteps[len(extraSteps)-1].StepNote += " — no DS records in parent, unsigned delegation (insecure)"
-				selfSteps, _ := attemptSelfVerification(signerZone, last, nsidRequested)
+				selfSteps, _ := attemptSelfVerification(signerZone, last, nsidRequested, reqEdnsOpts)
 				return "insecure", append(extraSteps, selfSteps...)
 			} else {
 				dbg("validate: DS response for %s has unexpected rcode %d → indeterminate", signerZone, dsResp.Rcode)
@@ -919,13 +930,13 @@ func validateChainOfTrust(chain []ResolutionStep, req *QueryRequest) (interface{
 				dsSigner := strings.ToLower(dns.Fqdn(sig.SignerName))
 				if dsSigner != last.zone {
 					dbg("validate: DS signer %q ≠ last zone %q — interpolating intermediate zone(s)", dsSigner, last.zone)
-					intKeys, intSteps, intOK, intInsecure := validateIntermediateZones(last.zone, dsSigner, last.ns, keys, nsidRequested)
+					intKeys, intSteps, intOK, intInsecure := validateIntermediateZones(last.zone, dsSigner, last.ns, keys, nsidRequested, reqEdnsOpts)
 					extraSteps = append(extraSteps, intSteps...)
 					if !intOK {
 						if intInsecure {
 							dbg("validate: intermediate zone %s is insecure — insecure", dsSigner)
 							extraSteps[dsStepIdx].StepNote += fmt.Sprintf(" — intermediate zone %s is insecure", dsSigner)
-							selfSteps, _ := attemptSelfVerification(signerZone, last, nsidRequested)
+							selfSteps, _ := attemptSelfVerification(signerZone, last, nsidRequested, reqEdnsOpts)
 							return "insecure", append(extraSteps, selfSteps...)
 						}
 						dbg("validate: intermediate zone %s failed → BOGUS", dsSigner)
@@ -961,7 +972,7 @@ func validateChainOfTrust(chain []ResolutionStep, req *QueryRequest) (interface{
 				dsStep := extraSteps[dsStepIdx]
 				extraSteps = extraSteps[:dsStepIdx] // drop dsStep; re-append after intSteps
 
-				_, intSteps, intOK, intInsecure := validateIntermediateZones(last.zone, signerParent, last.ns, keys, nsidRequested)
+				_, intSteps, intOK, intInsecure := validateIntermediateZones(last.zone, signerParent, last.ns, keys, nsidRequested, reqEdnsOpts)
 				extraSteps = append(extraSteps, intSteps...)
 
 				if !intOK && intInsecure {
@@ -978,7 +989,7 @@ func validateChainOfTrust(chain []ResolutionStep, req *QueryRequest) (interface{
 						dbg("validate: %s is insecure — insecure", signerParent)
 						dsStep.StepNote += fmt.Sprintf(" — %s is insecure", signerParent)
 						extraSteps = append(extraSteps, dsStep)
-						selfSteps, _ := attemptSelfVerification(signerZone, last, nsidRequested)
+						selfSteps, _ := attemptSelfVerification(signerZone, last, nsidRequested, reqEdnsOpts)
 						return "insecure", append(extraSteps, selfSteps...)
 					}
 				} else if !intOK {
@@ -1018,7 +1029,7 @@ func validateChainOfTrust(chain []ResolutionStep, req *QueryRequest) (interface{
 			}
 		}
 
-		childKeyResp, childKeyStep := fetchDNSKEYResponse(signerZone, last.ns, nsidRequested)
+		childKeyResp, childKeyStep := fetchDNSKEYResponse(signerZone, last.ns, nsidRequested, reqEdnsOpts)
 		childKeyStep.StepNote = fmt.Sprintf("Validating %s DNSKEY", signerZone)
 		if childKeyResp == nil {
 			dbg("validate: DNSKEY fetch failed for child zone %s", signerZone)
@@ -1347,9 +1358,9 @@ func convertZoneDS(zone string, anchors []TrustAnchorDS) []*dns.DS {
 // last.resp against those keys, without requiring a DS in the parent. Used to
 // show whether a zone is self-consistently signed before DS is published.
 // Returns extra steps and a human-readable note.
-func attemptSelfVerification(zone string, last zoneLevel, nsidRequested bool) ([]ResolutionStep, string) {
+func attemptSelfVerification(zone string, last zoneLevel, nsidRequested bool, reqEdnsOpts []dns.EDNS0) ([]ResolutionStep, string) {
 	dbg("validate: attemptSelfVerification for %s", zone)
-	keyResp, keyStep := fetchDNSKEYResponse(zone, last.ns, nsidRequested)
+	keyResp, keyStep := fetchDNSKEYResponse(zone, last.ns, nsidRequested, reqEdnsOpts)
 	keyStep.StepNote = fmt.Sprintf("Self-verification: fetching %s DNSKEY (no parent DS — not a chain-of-trust check)", zone)
 	if keyResp == nil {
 		dbg("validate: self-verify %s: DNSKEY fetch failed", zone)
@@ -1644,7 +1655,7 @@ func dsRRSigSigner(resp *dns.Msg) string {
 // It returns the validated DNSKEY set for signerZone, any extra steps, success, and isInsecure.
 // isInsecure is true when an intermediate zone has no DS in its parent (unsigned delegation);
 // it is false for other failures (RRSIG mismatch, fetch error, etc.) which are bogus/indeterminate.
-func validateIntermediateZones(parentZone, signerZone string, ns namedAddr, parentKeys []*dns.DNSKEY, nsidRequested bool) ([]*dns.DNSKEY, []ResolutionStep, bool, bool) {
+func validateIntermediateZones(parentZone, signerZone string, ns namedAddr, parentKeys []*dns.DNSKEY, nsidRequested bool, reqEdnsOpts []dns.EDNS0) ([]*dns.DNSKEY, []ResolutionStep, bool, bool) {
 	// Build the ordered list of zones to traverse from just below parentZone to signerZone.
 	var zones []string
 	for z := signerZone; z != parentZone; {
@@ -1662,7 +1673,7 @@ func validateIntermediateZones(parentZone, signerZone string, ns namedAddr, pare
 
 	for _, zone := range zones {
 		dbg("validate: intermediate zone %s: fetching DS", zone)
-		dsResp, dsStep := fetchDSResponse(zone, ns, nsidRequested)
+		dsResp, dsStep := fetchDSResponse(zone, ns, nsidRequested, reqEdnsOpts)
 		dsStep.StepNote = fmt.Sprintf("Fetching DS for intermediate zone %s (zone boundary inferred from RRSIG signer)", zone)
 		extraSteps = append(extraSteps, dsStep)
 
@@ -1697,7 +1708,7 @@ func validateIntermediateZones(parentZone, signerZone string, ns namedAddr, pare
 		}
 
 		dbg("validate: intermediate zone %s: fetching DNSKEY", zone)
-		keyResp, keyStep := fetchDNSKEYResponse(zone, ns, nsidRequested)
+		keyResp, keyStep := fetchDNSKEYResponse(zone, ns, nsidRequested, reqEdnsOpts)
 		keyStep.StepNote = fmt.Sprintf("Validating intermediate zone %s DNSKEY", zone)
 		extraSteps = append(extraSteps, keyStep)
 
@@ -1769,16 +1780,14 @@ func exchangeWithTCPFallback(msg *dns.Msg, addr string) (*dns.Msg, string, error
 // fetchDSResponse queries ns for the DS RRset at zone (used when an authoritative
 // server answers child-zone queries directly without a referral, so we never saw
 // the DS records in a referral authority section).
-func fetchDSResponse(zone string, ns namedAddr, nsidRequested bool) (*dns.Msg, ResolutionStep) {
+func fetchDSResponse(zone string, ns namedAddr, nsidRequested bool, reqEdnsOpts []dns.EDNS0) (*dns.Msg, ResolutionStep) {
 	m := new(dns.Msg)
 	m.SetQuestion(dns.Fqdn(zone), dns.TypeDS)
 	m.RecursionDesired = false
 	o := &dns.OPT{Hdr: dns.RR_Header{Name: ".", Rrtype: dns.TypeOPT}}
 	o.SetUDPSize(1232)
 	o.SetDo()
-	if nsidRequested {
-		o.Option = append(o.Option, &dns.EDNS0_NSID{Code: dns.EDNS0NSID})
-	}
+	o.Option = append(o.Option, reqEdnsOpts...)
 	m.Extra = append(m.Extra, o)
 
 	queryBytes, _ := m.Pack()
@@ -1846,16 +1855,14 @@ func verifyDSRRSigInAnswer(answer []dns.RR, parentKeys []*dns.DNSKEY) (bool, uin
 
 // fetchDNSKEYResponse queries ns for the DNSKEY RRset at zone, returning the full
 // DNS response and a ResolutionStep for the chain.
-func fetchDNSKEYResponse(zone string, ns namedAddr, nsidRequested bool) (*dns.Msg, ResolutionStep) {
+func fetchDNSKEYResponse(zone string, ns namedAddr, nsidRequested bool, reqEdnsOpts []dns.EDNS0) (*dns.Msg, ResolutionStep) {
 	m := new(dns.Msg)
 	m.SetQuestion(dns.Fqdn(zone), dns.TypeDNSKEY)
 	m.RecursionDesired = false
 	o := &dns.OPT{Hdr: dns.RR_Header{Name: ".", Rrtype: dns.TypeOPT}}
 	o.SetUDPSize(1232)
 	o.SetDo()
-	if nsidRequested {
-		o.Option = append(o.Option, &dns.EDNS0_NSID{Code: dns.EDNS0NSID})
-	}
+	o.Option = append(o.Option, reqEdnsOpts...)
 	m.Extra = append(m.Extra, o)
 
 	queryBytes, _ := m.Pack()
@@ -1904,6 +1911,86 @@ func extractNSIDFromMsg(resp *dns.Msg) string {
 		}
 	}
 	return ""
+}
+
+// extractZoneVersionFromMsg parses the ZONEVERSION option from a response OPT RR.
+func extractZoneVersionFromMsg(resp *dns.Msg) map[string]interface{} {
+	for _, extra := range resp.Extra {
+		if opt, ok := extra.(*dns.OPT); ok {
+			parsed := edns.ParseAll(opt)
+			if zvData, ok := parsed[dns.EDNS0ZONEVERSION]; ok {
+				return zvData
+			}
+			break
+		}
+	}
+	return nil
+}
+
+// cleanZoneVersionText replaces miekg's raw-byte ZONEVERSION rendering in a
+// response string with a human-readable version derived from parsed option data.
+// miekg's EDNS0_ZONEVERSION.String() simply returns the raw Version bytes, which
+// display as garbage for non-ASCII serials.
+func cleanZoneVersionText(text string, zvData map[string]interface{}) string {
+	if zvData == nil {
+		return text
+	}
+	const prefix = "; ZONEVERSION: "
+	if !strings.Contains(text, prefix) {
+		return text
+	}
+	readable := fmtZoneVersion(zvData)
+	out := &strings.Builder{}
+	remaining := text
+	for remaining != "" {
+		idx := strings.Index(remaining, prefix)
+		if idx < 0 {
+			out.WriteString(remaining)
+			break
+		}
+		out.WriteString(remaining[:idx])
+		out.WriteString(prefix)
+		out.WriteString(readable)
+		// Consume the raw bytes after the prefix up to the next newline.
+		after := remaining[idx+len(prefix):]
+		if nl := strings.IndexByte(after, '\n'); nl >= 0 {
+			out.WriteByte('\n')
+			remaining = after[nl+1:]
+		} else {
+			remaining = ""
+		}
+	}
+	return out.String()
+}
+
+// fmtZoneVersion formats a parsed ZONEVERSION option map as a readable string.
+func fmtZoneVersion(zv map[string]interface{}) string {
+	typeName, _ := zv["type_name"].(string)
+	if typeName == "" {
+		if t, ok := zv["type"].(int); ok {
+			typeName = fmt.Sprintf("type %d", t)
+		}
+	}
+	labels := 0
+	if l, ok := zv["label_count"].(int); ok {
+		labels = l
+	}
+	base := fmt.Sprintf("labels=%d %s", labels, typeName)
+	if serial, ok := zv["serial"].(uint32); ok {
+		return fmt.Sprintf("%s serial=%d", base, serial)
+	}
+	// For non-SOA-SERIAL types, show decimal value when the wire data is 4 bytes,
+	// plus hex for completeness.
+	if val, ok := zv["value"].(uint32); ok {
+		if vh, _ := zv["version_hex"].(string); vh != "" {
+			return fmt.Sprintf("%s value=%d (0x%s)", base, val, vh)
+		}
+		return fmt.Sprintf("%s value=%d", base, val)
+	}
+	if vh, ok := zv["version_hex"].(string); ok {
+		return fmt.Sprintf("%s version=%s", base, vh)
+	}
+	return base
 }
 
 func extractDNSKEYs(resp *dns.Msg) []*dns.DNSKEY {

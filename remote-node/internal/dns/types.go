@@ -57,28 +57,30 @@ type EDNSOptions struct {
 
 // QueryResponse is the JSON body returned from POST /.
 type QueryResponse struct {
-	DNSQueryMS      float64           `json:"dns_query_ms"`
-	Nameserver      string            `json:"nameserver"`
-	ResponseText    string            `json:"response_text"`
-	QueryBytesHex   string            `json:"query_bytes_hex"`
-	ResponseBytesHex string           `json:"response_bytes_hex"`
-	NSID            string            `json:"nsid,omitempty"`
-	DNSSECValid     interface{}       `json:"dnssec_valid"` // null | true | false | "indeterminate" | "insecure"
-	ResolutionChain []ResolutionStep  `json:"resolution_chain"`
-	Error           string            `json:"error,omitempty"`
+	DNSQueryMS       float64                `json:"dns_query_ms"`
+	Nameserver       string                 `json:"nameserver"`
+	ResponseText     string                 `json:"response_text"`
+	QueryBytesHex    string                 `json:"query_bytes_hex"`
+	ResponseBytesHex string                 `json:"response_bytes_hex"`
+	NSID             string                 `json:"nsid,omitempty"`
+	ZoneVersion      map[string]interface{} `json:"zoneversion,omitempty"`
+	DNSSECValid      interface{}            `json:"dnssec_valid"` // null | true | false | "indeterminate" | "insecure"
+	ResolutionChain  []ResolutionStep       `json:"resolution_chain"`
+	Error            string                 `json:"error,omitempty"`
 }
 
 // ResolutionStep holds the result of one iterative query in recursive mode.
 type ResolutionStep struct {
-	Nameserver       string  `json:"nameserver"`                // ip:port
-	NameserverName   string  `json:"nameserver_name,omitempty"` // hostname, if known
-	QName            string  `json:"qname"`
-	QType            string  `json:"qtype"`
-	StepNote         string  `json:"step_note,omitempty"`         // human-readable annotation for validation steps
-	ValidationStep   bool    `json:"validation_step,omitempty"`   // true for DNSSEC validation steps (not resolution)
-	NSID             string  `json:"nsid,omitempty"`
-	ResponseText     string  `json:"response_text"`
-	QueryBytesHex    string  `json:"query_bytes_hex"`
-	ResponseBytesHex string  `json:"response_bytes_hex"`
-	DNSQueryMS       float64 `json:"dns_query_ms"`
+	Nameserver       string                 `json:"nameserver"`                // ip:port
+	NameserverName   string                 `json:"nameserver_name,omitempty"` // hostname, if known
+	QName            string                 `json:"qname"`
+	QType            string                 `json:"qtype"`
+	StepNote         string                 `json:"step_note,omitempty"`       // human-readable annotation for validation steps
+	ValidationStep   bool                   `json:"validation_step,omitempty"` // true for DNSSEC validation steps (not resolution)
+	NSID             string                 `json:"nsid,omitempty"`
+	ZoneVersion      map[string]interface{} `json:"zoneversion,omitempty"`
+	ResponseText     string                 `json:"response_text"`
+	QueryBytesHex    string                 `json:"query_bytes_hex"`
+	ResponseBytesHex string                 `json:"response_bytes_hex"`
+	DNSQueryMS       float64                `json:"dns_query_ms"`
 }

@@ -369,6 +369,9 @@ function buildPayload(qname) {
   if (document.getElementById('edns-nsid').checked) {
     ednsOptions.push({ code: 3 });
   }
+  if (document.getElementById('edns-zoneversion').checked) {
+    ednsOptions.push({ code: 19 });
+  }
   if (document.getElementById('edns-ecs-enable').checked) {
     ednsOptions.push({
       code: 8,
@@ -543,6 +546,15 @@ function appendResultContent(body, data, mode) {
     body.appendChild(nsidEl);
   }
 
+  // ZONEVERSION.
+  if (data.zoneversion) {
+    const zvEl = document.createElement('div');
+    zvEl.className = 'response-text-block';
+    zvEl.style.fontSize = '0.75rem';
+    zvEl.textContent = fmtZoneVersion(data.zoneversion);
+    body.appendChild(zvEl);
+  }
+
   // Response text.
   if (data.response_text) {
     const pre = document.createElement('div');
@@ -607,6 +619,13 @@ function appendStepGroup(container, title, steps, titleClass) {
       nsidEl.style.fontSize = '0.75rem';
       nsidEl.textContent = `NSID: ${step.nsid}`;
       bodyEl.appendChild(nsidEl);
+    }
+    if (step.zoneversion) {
+      const zvEl = document.createElement('div');
+      zvEl.className = 'response-text-block';
+      zvEl.style.fontSize = '0.75rem';
+      zvEl.textContent = fmtZoneVersion(step.zoneversion);
+      bodyEl.appendChild(zvEl);
     }
     if (step.response_text) {
       const pre = document.createElement('div');
@@ -946,6 +965,15 @@ function buildHexView(container, bytes, annotations) {
 }
 
 // ── Utilities ─────────────────────────────────────────────────────────────────
+function fmtZoneVersion(zv) {
+  const typeName = zv.type_name || `type ${zv.type}`;
+  let s = `ZONEVERSION: labels=${zv.label_count}, ${typeName}`;
+  if (zv.serial !== undefined)       s += `, serial=${zv.serial}`;
+  else if (zv.value !== undefined)   s += `, value=${zv.value} (0x${zv.version_hex})`;
+  else if (zv.version_hex)           s += `, version=${zv.version_hex}`;
+  return s;
+}
+
 function hexToBytes(hex) {
   const arr = new Uint8Array(hex.length / 2);
   for (let i = 0; i < hex.length; i += 2) {
