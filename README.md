@@ -44,8 +44,8 @@ Web server (Apache or nginx + PHP 7.4+)
     - *Add mode*: your DS is accepted alongside the existing parent DS (pre-rollover check — tests that a new KSK won't break resolution)
     - *Replace mode*: your DS replaces the parent DS entirely (cut-over check — tests that removing the old DS and publishing a new one will work)
   - Signed zones with no parent DS are reported as *insecure* (RFC 4035 §5.2); a self-verification step shows whether the zone's own DNSSEC is self-consistent, and distinguishes expired RRSIGs from cryptographic failures
-- **Full DNS flag control** — RD, AD, CD, DO; EDNS UDP size; NSID; EDNS Client Subnet
-- **Packet visualiser** — Wireshark-style field/bit breakdown and tcpdump-style hex dump, with cross-highlighting between the two views
+- **Full DNS flag control** — RD, AD, CD, DO; EDNS UDP size override (auto-locked on when any EDNS option is active per RFC 6891 §6.1.2); NSID; EDNS Client Subnet; ZONEVERSION (RFC 9660, type 0 SOA-SERIAL)
+- **Packet visualiser** — Wireshark-style field/bit breakdown and tcpdump-style hex dump, with cross-highlighting between the two views; OPT records show UDP payload size, EDNS version, and DO bit rather than raw Class/TTL; EDNS options decoded inline (NSID as hex+ASCII, ECS as address family/prefix, ZONEVERSION as type and serial/value)
 - **Timing breakdown** — round-trip time, DNS query time, and overhead (network + PHP + Go handling) shown per node
 
 ---
