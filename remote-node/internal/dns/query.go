@@ -73,15 +73,8 @@ func execDirect(req *QueryRequest) *QueryResponse {
 
 	server := fmt.Sprintf("%s:%d", req.Nameserver, req.Port)
 
-	queryBytes, _ := msg.Pack()
-
-	client := &dns.Client{
-		Net:     network,
-		Timeout: 5 * time.Second,
-	}
-
 	start := time.Now()
-	resp, _, err := client.Exchange(msg, server)
+	resp, queryBytes, responseBytes, err := exchangeRaw(msg, server, network, 5*time.Second)
 	elapsed := time.Since(start).Seconds() * 1000
 
 	if err != nil {
@@ -92,8 +85,6 @@ func execDirect(req *QueryRequest) *QueryResponse {
 			Error:         err.Error(),
 		}
 	}
-
-	responseBytes, _ := resp.Pack()
 
 	qr := &QueryResponse{
 		DNSQueryMS:       elapsed,

@@ -312,11 +312,17 @@ const DNSParser = (() => {
         const key   = r.bytes(rdlen - 4);
         const zoneKey = (flags >> 8) & 1;
         const sep     = flags & 1;
+        // RFC 4034 Appendix B — key tag computed from full RDATA (general case; alg 1 omitted)
+        let ac = 0;
+        const rdata = buf.subarray(start, start + rdlen);
+        for (let i = 0; i < rdata.length; i++) ac += (i & 1) ? rdata[i] : rdata[i] << 8;
+        const keyTag = (ac + (ac >> 16)) & 0xffff;
         return [
           { start,     end: start+2, field: 'Flags', value: `0x${flags.toString(16).padStart(4,'0')} (Zone Key: ${zoneKey ? 'yes':'no'}, SEP: ${sep ? 'yes':'no'})` },
           { start: start+2, end: start+3, field: 'Protocol', value: proto },
           { start: start+3, end: start+4, field: 'Algorithm', value: algStr(alg) },
           { start: start+4, end: r.mark(), field: 'Public Key', value: `[${key.length} bytes]` },
+          { field: 'Key Tag', value: `${keyTag} (computed from RDATA)` },
         ];
       }
       case 46: { // RRSIG

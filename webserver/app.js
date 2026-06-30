@@ -207,9 +207,11 @@ function wireFormBehaviours() {
 function onModeChange() {
   const mode = document.querySelector('input[name="mode"]:checked')?.value;
   const targetFields = document.getElementById('target-fields');
+  const protoFields  = document.getElementById('proto-fields');
   const rdLabel = document.getElementById('flag-rd').closest('.check-label');
 
   targetFields.classList.toggle('hidden', mode !== 'target');
+  protoFields.classList.toggle('hidden', mode === 'recursive');
 
   if (mode === 'recursive') {
     rdLabel.setAttribute('aria-disabled', 'true');
@@ -476,14 +478,20 @@ async function queryNode(tag, nodeName, payload) {
   }
 }
 
-// Returns a display label for a node, appending target IP and protocol in target mode.
+// Returns a display label for a node, appending target IP and protocol in target mode,
+// or just the protocol in localhost mode when TCP is selected.
 function nodeLabel(name, payload) {
-  if (payload.mode !== 'target') return name;
-  const ns = (payload.nameserver || '').trim();
-  if (!ns) return name;
-  const port = payload.port && payload.port !== 53 ? `:${payload.port}` : '';
-  const proto = payload.use_tcp ? 'TCP' : 'UDP';
-  return `${name} · ${ns}${port} via ${proto}`;
+  if (payload.mode === 'target') {
+    const ns = (payload.nameserver || '').trim();
+    if (!ns) return name;
+    const port = payload.port && payload.port !== 53 ? `:${payload.port}` : '';
+    const proto = payload.use_tcp ? 'TCP' : 'UDP';
+    return `${name} · ${ns}${port} via ${proto}`;
+  }
+  if (payload.mode === 'localhost' && payload.use_tcp) {
+    return `${name} · TCP`;
+  }
+  return name;
 }
 
 // ── Result panel building ─────────────────────────────────────────────────────
@@ -536,12 +544,15 @@ function buildResultPanel(name, data, accordion, mode) {
 
 function timingHTML(data) {
   if (data.error && !data.api_ms) return '';
-  const dns = data.dns_query_ms != null ? data.dns_query_ms.toFixed(1) : null;
-  const api = data.api_ms != null ? data.api_ms.toFixed(1) : null;
-  if (!api) return dns ? `<span class="dns-time">${dns}ms DNS</span>` : '';
-  const overhead = api && dns ? (parseFloat(api) - parseFloat(dns)).toFixed(1) : null;
+  const dns   = data.dns_query_ms != null ? data.dns_query_ms.toFixed(1) : null;
+  const api   = data.api_ms       != null ? data.api_ms.toFixed(1)       : null;
+  const sizes = packetSizeStr(data.query_bytes_hex, data.response_bytes_hex);
+  const sizesHtml = sizes ? ` &nbsp;&middot; ${sizes}` : '';
+  if (!api) return dns ? `<span class="dns-time">${dns}ms DNS</span>${sizesHtml}` : sizesHtml;
+  const overhead = dns ? (parseFloat(api) - parseFloat(dns)).toFixed(1) : null;
   return `Round-trip: <span class="dns-time">${api}ms</span>`
-    + (dns ? ` &nbsp;(DNS: ${dns}ms / overhead: ${overhead}ms)` : '');
+    + (dns ? ` &nbsp;(DNS: ${dns}ms / overhead: ${overhead}ms)` : '')
+    + sizesHtml;
 }
 
 function appendResultContent(body, data, mode) {
@@ -632,10 +643,12 @@ function appendStepGroup(container, title, steps, titleClass) {
       ? `${esc(step.nameserver_name)} (${esc(step.nameserver)})`
       : esc(step.nameserver);
     const noteHtml = step.step_note
-      ? ` <span class="chain-step-note">${esc(step.step_note)}</span>`
+      ? `<span class="chain-step-note">${esc(step.step_note)}</span>`
       : '';
-    hdr.innerHTML = `<span>${i + 1}. ${nsLabel} → ${esc(step.qname)} ${esc(step.qtype)}${noteHtml}</span>`
-      + `<span>${step.dns_query_ms.toFixed(1)}ms</span>`;
+    const stepSizes = packetSizeStr(step.query_bytes_hex, step.response_bytes_hex);
+    hdr.innerHTML = `<span>${i + 1}. ${nsLabel} → ${esc(step.qname)} ${esc(step.qtype)}</span>`
+      + `<span>${step.dns_query_ms.toFixed(1)}ms${stepSizes ? ` &nbsp;&middot; ${stepSizes}` : ''}</span>`
+      + noteHtml;
     hdr.addEventListener('click', () => stepEl.classList.toggle('open'));
 
     const bodyEl = document.createElement('div');
@@ -992,6 +1005,15 @@ function buildHexView(container, bytes, annotations) {
 }
 
 // ── Utilities ─────────────────────────────────────────────────────────────────
+function packetSizeStr(queryHex, respHex) {
+  const sent = queryHex ? queryHex.length / 2 : null;
+  const rcvd = respHex  ? respHex.length  / 2 : null;
+  if (sent && rcvd) return `sent ${sent} B / rcvd ${rcvd} B`;
+  if (rcvd)         return `rcvd ${rcvd} B`;
+  if (sent)         return `sent ${sent} B`;
+  return '';
+}
+
 function fmtZoneVersion(zv) {
   const typeName = zv.type_name || `type ${zv.type}`;
   let s = `ZONEVERSION: labels=${zv.label_count}, ${typeName}`;

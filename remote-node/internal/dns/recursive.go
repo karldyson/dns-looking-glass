@@ -104,10 +104,8 @@ func execRecursive(req *QueryRequest) *QueryResponse {
 			msg.Extra = append(msg.Extra, o)
 		}
 
-		queryBytes, _ := msg.Pack()
-
 		start := time.Now()
-		resp, tcNote, err := exchangeWithTCPFallback(msg, cur.addr)
+		resp, queryBytes, responseBytes, tcNote, err := exchangeWithTCPFallback(msg, cur.addr)
 		elapsed := time.Since(start).Seconds() * 1000
 
 		stepEntry := ResolutionStep{
@@ -129,7 +127,6 @@ func execRecursive(req *QueryRequest) *QueryResponse {
 			continue
 		}
 
-		responseBytes, _ := resp.Pack()
 		stepEntry.ResponseText = resp.String()
 		if tcNote != "" {
 			stepEntry.ResponseText = "; " + tcNote + "\n" + stepEntry.ResponseText
@@ -1504,26 +1501,22 @@ func fetchLocalRootTrust() (bool, ResolutionStep) {
 	o.SetDo()
 	m.Extra = append(m.Extra, o)
 
-	queryBytes, _ := m.Pack()
+	start := time.Now()
+	resp, queryBytes, responseBytes, err := exchangeRaw(m, "127.0.0.1:53", "udp", 5*time.Second)
 	step := ResolutionStep{
 		Nameserver:     "127.0.0.1:53",
 		NameserverName: "localhost (trust anchor check)",
 		QName:          ".",
 		QType:          "DNSKEY",
+		DNSQueryMS:     time.Since(start).Seconds() * 1000,
 		QueryBytesHex:  hex.EncodeToString(queryBytes),
 	}
-
-	c := &dns.Client{Net: "udp", Timeout: 5 * time.Second}
-	start := time.Now()
-	resp, _, err := c.Exchange(m, "127.0.0.1:53")
-	step.DNSQueryMS = time.Since(start).Seconds() * 1000
 
 	if err != nil {
 		step.ResponseText = fmt.Sprintf("error: %v", err)
 		return false, step
 	}
 
-	responseBytes, _ := resp.Pack()
 	step.ResponseText = resp.String()
 	step.ResponseBytesHex = hex.EncodeToString(responseBytes)
 	return resp.AuthenticatedData, step
@@ -1761,24 +1754,62 @@ func validateIntermediateZones(parentZone, signerZone string, ns namedAddr, pare
 	return currentKeys, extraSteps, true, false
 }
 
+// exchangeRaw dials addr over network, sends msg, and returns the parsed response
+// alongside the exact query and response wire bytes. Using raw bytes avoids the size
+// discrepancy that arises when miekg's Pack() re-serialises without name compression
+// (received messages have Compress=false by default, so owner names that the server
+// sent as 2-byte pointers are emitted uncompressed, inflating the reported size).
+func exchangeRaw(msg *dns.Msg, addr, network string, timeout time.Duration) (*dns.Msg, []byte, []byte, error) {
+	rawQuery, err := msg.Pack()
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("pack: %w", err)
+	}
+	co, err := dns.DialTimeout(network, addr, timeout)
+	if err != nil {
+		return nil, rawQuery, nil, err
+	}
+	defer co.Close()
+	co.SetDeadline(time.Now().Add(timeout))
+	// Match the EDNS UDP size from the query so ReadMsgHeader allocates a large enough
+	// receive buffer. dns.Client.Exchange does this automatically; dns.DialTimeout does not.
+	// Without this, responses larger than dns.MinMsgSize (512 B) are silently truncated
+	// by the OS read, producing a corrupt packet that fails Unpack.
+	if opt := msg.IsEdns0(); opt != nil && opt.UDPSize() >= dns.MinMsgSize {
+		co.UDPSize = opt.UDPSize()
+	} else {
+		co.UDPSize = dns.DefaultMsgSize // safe default for non-EDNS queries
+	}
+	if err := co.WriteMsg(msg); err != nil {
+		return nil, rawQuery, nil, err
+	}
+	rawResp, err := co.ReadMsgHeader(nil)
+	if err != nil {
+		return nil, rawQuery, nil, err
+	}
+	resp := new(dns.Msg)
+	if err := resp.Unpack(rawResp); err != nil {
+		return nil, rawQuery, rawResp, fmt.Errorf("unpack: %w", err)
+	}
+	return resp, rawQuery, rawResp, nil
+}
+
 // exchangeWithTCPFallback sends msg to addr over UDP. If the response has TC=1,
 // it retries over TCP and returns the complete response plus a note for the UI.
-func exchangeWithTCPFallback(msg *dns.Msg, addr string) (*dns.Msg, string, error) {
-	c := &dns.Client{Net: "udp", Timeout: 5 * time.Second}
-	resp, _, err := c.Exchange(msg, addr)
+// Returns raw wire bytes for both query and response (actual received bytes, not re-packed).
+func exchangeWithTCPFallback(msg *dns.Msg, addr string) (*dns.Msg, []byte, []byte, string, error) {
+	resp, rawQ, rawR, err := exchangeRaw(msg, addr, "udp", 5*time.Second)
 	if err != nil {
-		return nil, "", err
+		return nil, rawQ, rawR, "", err
 	}
 	if !resp.Truncated {
-		return resp, "", nil
+		return resp, rawQ, rawR, "", nil
 	}
-	tcp := &dns.Client{Net: "tcp", Timeout: 5 * time.Second}
-	r, _, tcpErr := tcp.Exchange(msg, addr)
+	tcpResp, rawQTCP, rawRTCP, tcpErr := exchangeRaw(msg, addr, "tcp", 5*time.Second)
 	if tcpErr != nil {
 		// TCP failed too — return the truncated UDP response and note the attempt.
-		return resp, fmt.Sprintf("UDP response truncated (TC=1); TCP retry failed: %v", tcpErr), nil
+		return resp, rawQ, rawR, fmt.Sprintf("UDP response truncated (TC=1); TCP retry failed: %v", tcpErr), nil
 	}
-	return r, "UDP response truncated (TC=1) — retried over TCP", nil
+	return tcpResp, rawQTCP, rawRTCP, "UDP response truncated (TC=1) — retried over TCP", nil
 }
 
 // fetchDSResponse queries ns for the DS RRset at zone (used when an authoritative
@@ -1794,25 +1825,22 @@ func fetchDSResponse(zone string, ns namedAddr, nsidRequested bool, reqEdnsOpts 
 	o.Option = append(o.Option, reqEdnsOpts...)
 	m.Extra = append(m.Extra, o)
 
-	queryBytes, _ := m.Pack()
+	start := time.Now()
+	resp, queryBytes, responseBytes, tcNote, err := exchangeWithTCPFallback(m, ns.addr)
 	step := ResolutionStep{
 		Nameserver:     ns.addr,
 		NameserverName: ns.name,
 		QName:          dns.Fqdn(zone),
 		QType:          "DS",
+		DNSQueryMS:     time.Since(start).Seconds() * 1000,
 		QueryBytesHex:  hex.EncodeToString(queryBytes),
 	}
-
-	start := time.Now()
-	resp, tcNote, err := exchangeWithTCPFallback(m, ns.addr)
-	step.DNSQueryMS = time.Since(start).Seconds() * 1000
 
 	if err != nil {
 		step.ResponseText = fmt.Sprintf("error: %v", err)
 		return nil, step
 	}
 
-	responseBytes, _ := resp.Pack()
 	step.ResponseText = resp.String()
 	if tcNote != "" {
 		step.ResponseText = "; " + tcNote + "\n" + step.ResponseText
@@ -1869,25 +1897,22 @@ func fetchDNSKEYResponse(zone string, ns namedAddr, nsidRequested bool, reqEdnsO
 	o.Option = append(o.Option, reqEdnsOpts...)
 	m.Extra = append(m.Extra, o)
 
-	queryBytes, _ := m.Pack()
+	start := time.Now()
+	resp, queryBytes, responseBytes, tcNote, err := exchangeWithTCPFallback(m, ns.addr)
 	step := ResolutionStep{
 		Nameserver:     ns.addr,
 		NameserverName: ns.name,
 		QName:          dns.Fqdn(zone),
 		QType:          "DNSKEY",
+		DNSQueryMS:     time.Since(start).Seconds() * 1000,
 		QueryBytesHex:  hex.EncodeToString(queryBytes),
 	}
-
-	start := time.Now()
-	resp, tcNote, err := exchangeWithTCPFallback(m, ns.addr)
-	step.DNSQueryMS = time.Since(start).Seconds() * 1000
 
 	if err != nil {
 		step.ResponseText = fmt.Sprintf("error: %v", err)
 		return nil, step
 	}
 
-	responseBytes, _ := resp.Pack()
 	step.ResponseText = resp.String()
 	if tcNote != "" {
 		step.ResponseText = "; " + tcNote + "\n" + step.ResponseText

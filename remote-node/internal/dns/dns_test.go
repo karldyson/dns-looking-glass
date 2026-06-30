@@ -54,7 +54,7 @@ func TestExchangeWithTCPFallback_Truncated(t *testing.T) {
 	q := new(dns.Msg)
 	q.SetQuestion("example.com.", dns.TypeA)
 
-	resp, note, err := exchangeWithTCPFallback(q, addr)
+	resp, _, _, note, err := exchangeWithTCPFallback(q, addr)
 	if err != nil {
 		t.Fatalf("exchangeWithTCPFallback: %v", err)
 	}
@@ -96,7 +96,7 @@ func TestExchangeWithTCPFallback_NoTruncation(t *testing.T) {
 	q := new(dns.Msg)
 	q.SetQuestion("example.com.", dns.TypeA)
 
-	resp, note, err := exchangeWithTCPFallback(q, srv.PacketConn.LocalAddr().String())
+	resp, _, _, note, err := exchangeWithTCPFallback(q, srv.PacketConn.LocalAddr().String())
 	if err != nil {
 		t.Fatalf("exchangeWithTCPFallback: %v", err)
 	}
