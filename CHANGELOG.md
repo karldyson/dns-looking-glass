@@ -4,6 +4,22 @@ All notable changes to DNS Looking Glass are documented here. Version numbers co
 
 ---
 
+## [v0.5.2] — 2026-06-30
+
+### Added
+
+- **Packet payload sizes** — timing bar now shows `sent N B / rcvd N B` alongside query timing in all three modes. Recursive mode also shows per-step sizes in each resolution chain step header. The `packetSizeStr()` helper handles partial data gracefully (e.g. when only a sent size is available due to an error before the response arrived).
+- **UDP/TCP protocol toggle in Localhost mode** — the Protocol (UDP/TCP) radio buttons were previously only visible in Specify IP mode. They are now shown for Localhost mode as well, and hidden only for Full Recursive mode (which manages its own transport). The node label appends `· TCP` when TCP is explicitly selected in Localhost mode.
+- **DNSKEY Key Tag in packet detail** — the packet visualiser now shows the DNSKEY key tag as a computed field at the end of the DNSKEY RDATA tree. Computed per RFC 4034 Appendix B from the full RDATA bytes. The field is informational only (no hex cross-highlight, since the key tag is derived from all RDATA bytes rather than residing at a fixed wire offset).
+
+### Fixed
+
+- **Inaccurate wire byte sizes** — packet sizes were previously derived by calling `resp.Pack()` on the parsed response. `miekg/dns` sets `Compress=false` on received messages by default, so `Pack()` emits full owner names rather than compression pointers, inflating the reported size by roughly 10 bytes per compressed name reference (a 1317 B packet appeared as 1367 B). All query paths (main iterative loop, DNSKEY/DS fetch helpers, direct query modes, local root trust check) now use a new `exchangeRaw` helper that dials with `dns.DialTimeout`, writes with `conn.WriteMsg`, and reads with `conn.ReadMsgHeader` to capture exact wire bytes without re-serialisation.
+- **"Overflowing header size" on large UDP responses** — `dns.DialTimeout` creates a `*dns.Conn` with `UDPSize = 0`, which caused `ReadMsgHeader` to allocate only a 512 B receive buffer. Responses larger than 512 B (DNSKEY records, large referral packets) were silently truncated by the OS read, producing `unpack: dns: overflowing header size` errors. Fixed by setting `co.UDPSize` from the EDNS OPT record in the outgoing query before calling `ReadMsgHeader` (falling back to `dns.DefaultMsgSize` = 4096 for non-EDNS queries). `dns.Client.Exchange` does this automatically; the new `exchangeRaw` path now matches that behaviour.
+- **Step note causing timing to wrap** — validation step notes (italic annotation text in resolution chain step headers) were inline in the left `<span>`, pushing the right-aligned timing and size info off the end of the row on long notes. The note is now a full-width flex item rendered on its own line beneath the step label and timing.
+
+---
+
 ## [v0.5.1] — 2026-06-25
 
 ### Added
